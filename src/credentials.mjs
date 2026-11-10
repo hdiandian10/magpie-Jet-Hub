@@ -274,6 +274,43 @@ function assertStandardIndent(lines, start, what) {
 }
 
 /**
+ * 把 `refs:` 段从 YAML **流式写法**（`{ … }`，条目用逗号分隔）就地改写成**标准块式**
+ * （每行 `  KEY: value`）。
+ *
+ * 背景（本仓改动）：DSH 某些版本会把 `refs:` 序列化成流式，而本插件写入侧只认
+ * 「2 空格块式」（`assertStandardIndent` 见到 4 空格流式会拒绝写）。这里在**读写入口**
+ * 统一做「流式→块式」归一：值原样保留（仅去掉流式的分隔逗号与多余缩进），不改语义。
+ */
+function normalizeFlowRefs(text) {
+  if (typeof text !== 'string' || text.indexOf('refs:') < 0) return text
+  const lines = text.split(/\r?\n/)
+  const start = normalizeRefsHead(lines)
+  if (start < 0) return text
+  let j = start + 1
+  while (j < lines.length && lines[j].trim() === '') j++
+  if (j >= lines.length || lines[j].trim() !== '{') return text
+  let close = -1
+  for (let k = j + 1; k < lines.length; k++) {
+    const t = lines[k].trim()
+    if (t === '}') { close = k; break }
+    if (t === '') continue
+    if (!/^[ \t]/.test(lines[k])) return text
+  }
+  if (close < 0) return text
+  const block = []
+  for (let k = j + 1; k < close; k++) {
+    const raw = lines[k]
+    if (raw.trim() === '') continue
+    let body = raw.replace(/[ \t]+$/, '')
+    if (body.endsWith(',')) body = body.slice(0, -1).replace(/[ \t]+$/, '')
+    const content = body.replace(/^[ \t]+/, '')
+    if (content === '') continue
+    block.push('  ' + content)
+  }
+  return [...lines.slice(0, start + 1), ...block, ...lines.slice(close + 1)].join('\n')
+}
+
+/**
  * 把一个 ref 编码成文件里的行。
  *
  * 值含换行时写**块标量**（`|-` / `|` / `|+`），不能像以前那样折成空格：
@@ -341,6 +378,7 @@ function refLines(key, value) {
  * 再用本函数区分「文件认得但没有这条」与「整份文件根本解析不出」。
  */
 export function scanRefKeys(text) {
+  text = normalizeFlowRefs(text)
   const lines = text.split(/\r?\n/)
   const out = new Set()
   const start = normalizeRefsHead(lines)
@@ -412,6 +450,7 @@ function quoteClosed(s) {
 }
 
 export function parseRefs(text) {
+  text = normalizeFlowRefs(text)
   const lines = text.split(/\r?\n/)
   const out = new Map()
   const start = normalizeRefsHead(lines)
@@ -587,6 +626,7 @@ function normalizeRefsHead(lines) {
 
 /** 把 refs 写回 .credentials.yaml：只替换值所在行，其余字节原样保留。 */
 export function writeRefsInto(text, changed) {
+  text = normalizeFlowRefs(text)
   const lines = text.split(/\r?\n/)
   const start = normalizeRefsHead(lines)
   if (start < 0) throw new Error(`${CRED_BASENAME}: 找不到 refs: 段`)
@@ -709,6 +749,7 @@ export function writeRefsInto(text, changed) {
 export function deleteRefsFrom(text, names) {
   const drop = new Set([...names].map(String))
   if (drop.size === 0) return text
+  text = normalizeFlowRefs(text)
   const lines = text.split(/\r?\n/)
   const start = normalizeRefsHead(lines)
   if (start < 0) return text
@@ -777,6 +818,7 @@ export function deleteRefsFrom(text, names) {
  * 而 refs 段保持「一个 ref 一行」的可读形态。
  */
 export function upsertRefsInto(text, changed) {
+  text = normalizeFlowRefs(text)
   // Existence must come from scanRefKeys (text scan), not parseRefs
   // (verified by review 2026-11-01): parseRefs' job is to *decode values*, so it
   // silently skips an entry it cannot decode (an unterminated quote swallows the

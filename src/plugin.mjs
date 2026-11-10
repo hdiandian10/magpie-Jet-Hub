@@ -53,6 +53,40 @@ import { fileURLToPath } from 'node:url'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
+/**
+ * Jet Hub 状态文档路径（账号池、模型黑名单都在这份 JSON 里）。
+ * 与 vendor 的 `createJetHubStore` 同口径：`$DSH_HOME` 优先，否则 `~/.dsh`。
+ */
+function jetHubStateFile() {
+  const home = process.env.DSH_HOME && process.env.DSH_HOME.trim()
+    ? process.env.DSH_HOME
+    : join(homedir(), '.dsh')
+  return join(home, 'jet-hub', 'state.json')
+}
+
+/**
+ * 本机 Jet Hub 账号池里「已经有账号」的 provider 集合（纯读 state.json，同步、便宜）。
+ *
+ * 用途：**选择性注册** —— 只有这里列出的渠道才注册成 magpie provider、才写进
+ * DSH 的模型路由；从没登录过的渠道不再以「已登录（本机 DSH 未登录该渠道）」的
+ * 占位空卡出现。想用某个渠道就在 Jet Hub 控制台里登录它（账号落进 state.json），
+ * 重开 magpie 后这家自动出现。
+ *
+ * 判据只认「有账号条目」，与 vendor `hasLoggedInAccount` 的「有条目」那一层一致；
+ * 文件不存在 / 读坏时视为零账号（不注册任何渠道，控制台照常能登录）。
+ */
+export function providersWithAccounts() {
+  const set = new Set()
+  try {
+    const doc = JSON.parse(readFileSync(jetHubStateFile(), 'utf8'))
+    const list = Array.isArray(doc?.accounts) ? doc.accounts : []
+    for (const a of list) {
+      if (a && typeof a.provider === 'string' && a.provider) set.add(a.provider)
+    }
+  } catch { /* 文件不存在 / 读坏 —— 视为零账号 */ }
+  return set
+}
+
 /** provider id 前缀。 */
 export const PROVIDER_PREFIX = 'jet-hub-'
 
@@ -577,6 +611,7 @@ function warmUp(container, log) {
         providers: DSH_PROVIDERS,
         idOf,
         failedProviders: got.failedProviders,
+        emptyProviders: DSH_PROVIDERS.filter((p) => !providersWithAccounts().has(p)),
         log,
       })
     })
@@ -1893,6 +1928,10 @@ export function makePlugin(dshProvider) {
      * 全量还没拉到时退回实时可用，保证首屏至少有东西可选。
      */
     function currentModels(provider) {
+      // 零账号渠道不返回任何模型（本仓改动）：不然 config 钩子会把这家上游全量
+      // 目录（几百条 jet-hub-*）写进 DSH 的模型选择器。provider 仍注册、仍能登录；
+      // 一旦登录，state.json 有账号，这里立即返回真实目录（无需重启）。
+      if (!providersWithAccounts().has(dshProvider)) return {}
       const { live, full } = currentAll(container, log)
       // 用户可以在 magpie 里拨「模型列表用上游全量」这个开关关掉全量
       const picked = pickModels(dshProvider, { live, full }, optionOn('prefer_full', true))

@@ -105,16 +105,12 @@ export function planAuthRecords(accounts, { providers, idOf, skipProviders }) {
       .sort((a, b) => Number(b?.enabled !== false) - Number(a?.enabled !== false))
 
     if (mine.length === 0) {
-      // 本体里没有这个渠道的账号：仍写一条占位记录，否则 magpie 报
-      // `no plugin signs in to <id>`，卡片点不动。
-      const why = '（本机 DSH 未登录该渠道）'
-      next[magpieId] = {
-        type: 'api',
-        key: `jet-hub-local:${dsh}`,
-        accountId: why,
-        metadata: { via: 'jet-hub', dshProvider: dsh },
-      }
-      report.push([magpieId, 0, why])
+      // 本体里没有这个渠道的账号 ⇒ **不写占位记录**（本仓改动）。
+      // 选择性注册（src/plugin.mjs）已经让没账号的渠道根本不注册成 magpie
+      // provider，所以不需要靠占位来「让卡片可点」；写了反而会在供应商页显示成
+      // 「已登录（本机 DSH 未登录该渠道）」的假登录。等用户真的登录后，
+      // 下一轮 sync 会写入真实记录、provider 也会随之注册出现。
+      report.push([magpieId, 0, ''])
       continue
     }
 
@@ -191,6 +187,7 @@ export function syncPluginAuth({
   authPath = defaultAuthPath(),
   dryRun = false,
   failedProviders = [],
+  emptyProviders = [],
 }) {
   // ⚠️ 最后一道防线：测试态绝不写真实用户配置。2026-11-01 因为少了这道，
   // 跑一次 `node tests/t-key-account.mjs` 就把用户 60 行真实账号塌成 23 条占位。
@@ -222,7 +219,10 @@ export function syncPluginAuth({
   // 而本机 accio / autoclawintl / codely / gemini 常年零账号、失败是常态 ——
   // 那等于本插件的旧记录（以及 legacy 垃圾）永远清不掉。
   const skipIds = new Set([...skipProviders].map((p) => idOf(p)))
-  const keepDueToFailure = (k) => skipIds.has(k.split('#')[0])
+  // 本机确实零账号的渠道：即使这轮 RPC 抛错（也出现在 failedProviders 里），也不再
+  // 保留它们的旧占位键 —— 否则「已登录（本机 DSH 未登录该渠道）」会一直复活。
+  const emptyIds = new Set([...emptyProviders].map((p) => idOf(p)))
+  const keepDueToFailure = (k) => skipIds.has(k.split('#')[0]) && !emptyIds.has(k.split('#')[0])
   const kept = Object.fromEntries(
     Object.entries(all).filter(([k]) => (!isOurKey(k) && !legacy.includes(k)) || keepDueToFailure(k)),
   )
@@ -267,6 +267,7 @@ export async function syncAuthQuietly({
   idOf,
   authPath,
   failedProviders = [],
+  emptyProviders = [],
   log = () => {},
 }) {
   // ⚠️ 这条闸门是**事故换来的**（2026-11-01）：测试用临时 home 起容器时账号集是
@@ -275,7 +276,7 @@ export async function syncAuthQuietly({
   // 所以测试还是全绿，没人发现。
   if (process.env.JET_HUB_NO_AUTH_SYNC === '1') return null
   try {
-    const r = syncPluginAuth({ accounts, providers, idOf, authPath, failedProviders })
+    const r = syncPluginAuth({ accounts, providers, idOf, authPath, failedProviders, emptyProviders })
     if (r.wrote) {
       log(
         `magpie 登录记录已对齐：${r.keys} 条（替换 ${r.removed.length} 条旧键）` +

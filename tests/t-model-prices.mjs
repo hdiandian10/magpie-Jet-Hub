@@ -23,7 +23,7 @@
  * 跑法：`node tests/t-model-prices.mjs`（不联网、不碰真实 ~/.dsh）
  */
 import { MODEL_PRICES, MODEL_PRICE_SRC } from '../src/model-prices.mjs'
-import { fallbackFor, pickModels } from '../src/plugin.mjs'
+import { DSH_PROVIDERS, fallbackFor, pickModels } from '../src/plugin.mjs'
 
 // 测试绝不写真实 magpie 配置（2026-11-01 事故：单跑这个文件曾把用户 60 行账号写塌）
 process.env.JET_HUB_NO_AUTH_SYNC = '1'
@@ -132,6 +132,13 @@ console.log('\n接进 provider.models()（全量目录）：')
   process.env.DSH_HOME = path.join(TMP, '.dsh')
   process.env.DSH_JET_HUB_STATE_DIR = TMP
   process.env.JET_HUB_NO_ADDR_FILE = '1'
+  process.env.JET_HUB_MODELS_CACHE = path.join(TMP, '.config', 'magpie', 'jet-hub-models.json')
+  // 本仓契约「零账号渠道不返回模型」：给所有渠道种账号让门放行（否则 models() 恒空）。
+  fs.mkdirSync(path.join(TMP, '.dsh', 'jet-hub'), { recursive: true })
+  fs.writeFileSync(
+    path.join(TMP, '.dsh', 'jet-hub', 'state.json'),
+    JSON.stringify({ accounts: DSH_PROVIDERS.map((p) => ({ provider: p, id: `seed-${p}`, enabled: true })) }),
+  )
   try {
     const mod = await import('file://' + ROOT.replace(/\\/g, '/') + '/index.mjs')
     let rows = 0

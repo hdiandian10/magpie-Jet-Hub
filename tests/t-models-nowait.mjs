@@ -1,5 +1,7 @@
 // 验证 provider.models 不再阻塞（magpie 只给 20s），且按 provider 切分正确
 import * as mod from '../index.mjs'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 // 单跑时别改写用户的 `~/.config/magpie/jet-hub-console.json`（理由见 t-plugin.mjs 的长注释）
 process.env.JET_HUB_NO_ADDR_FILE = '1'
@@ -8,6 +10,12 @@ process.env.JET_HUB_NO_ADDR_FILE = '1'
 import { isolate } from './_iso.mjs'
 
 const iso = isolate()
+// 本仓契约「零账号渠道不返回模型」：给 workbuddy 种一个账号，让模型门放行。
+mkdirSync(join(iso.root, '.dsh', 'jet-hub'), { recursive: true })
+writeFileSync(
+  join(iso.root, '.dsh', 'jet-hub', 'state.json'),
+  JSON.stringify({ accounts: [{ provider: 'workbuddy', id: 'wb-seed', enabled: true }] }),
+)
 const plugin = await mod.JetHubWorkbuddyPlugin({ client: { app: { log: (o) => console.log('  [log]', o.message) } } }, iso.options())
 const cfg = {}
 await plugin.config(cfg)

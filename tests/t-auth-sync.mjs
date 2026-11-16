@@ -6,7 +6,7 @@
  * 那个文件以前只由 `scripts/seed-auth.mjs` 手动同步，账号一删就永远歪着。
  * 现在插件启动后自动对齐，这个测试守住三件事：
  *
- * 1. 摊平规则（谁先谁后、key 长什么样、没账号时的占位）；
+ * 1. 摊平规则（谁先谁后、key 长什么样、没账号时**不写占位**——本仓改动）；
  * 2. 只动自己的键 —— 别的插件的记录一条都不能少；
  * 3. 幂等 —— 内容没变就不写盘（否则每次启动都刷一个备份文件）。
  */
@@ -67,12 +67,9 @@ const accounts = [
   ok(off?.accountId === 'betsy50（已停用）', `停用账号要标注（实际 ${JSON.stringify(off?.accountId)}）`)
   ok(off?.metadata?.enabled === false, '停用账号的 metadata.enabled 是 false')
 
-  // 没账号的渠道必须有占位记录，否则 magpie 报 `no plugin signs in to <id>`
-  ok(next['jet-hub-codedearts-not-exist'] !== undefined, '无账号的渠道也要写占位')
-  ok(
-    String(next['jet-hub-codedearts-not-exist'].key) === 'jet-hub-local:codedearts-not-exist',
-    '占位记录的 key 不带 /账号 id（挑它等于不钉号）',
-  )
+  // 本仓契约：无账号渠道**不写占位**（选择性注册；provider 仍能登录，但不出空卡/假登录）。
+  // 旧行为是写一条「（本机 DSH 未登录该渠道）」占位，已由 f3cc595 改掉。
+  ok(next['jet-hub-codedearts-not-exist'] === undefined, '无账号的渠道不写占位（本仓改动）')
   ok(report.length === providers.length, '报告按 provider 逐条给')
 }
 
@@ -158,7 +155,7 @@ const accounts = [
   })
   ok(r3.wrote === true, '账号删掉后要重写')
   const after3 = JSON.parse(fs.readFileSync(authPath, 'utf8'))
-  ok(after3['jet-hub-magicrew']?.key === 'jet-hub-local:magicrew', '账号没了要退回占位记录，不能留着旧 id')
+  ok(after3['jet-hub-magicrew'] === undefined, '账号没了 → 记录消失（本仓：不写占位，不留旧 id）')
 
   // 首次启动：文件根本不存在 —— 不能因为备份就 ENOENT（2026-11-01 一审必修 4）
   {

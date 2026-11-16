@@ -28,6 +28,13 @@ writeFileSync(
   }),
 )
 
+// 本仓契约「零账号渠道不返回模型」：测试要验模型接线，先给各渠道种一个账号让门放行。
+mkdirSync(join(iso.root, '.dsh', 'jet-hub'), { recursive: true })
+writeFileSync(
+  join(iso.root, '.dsh', 'jet-hub', 'state.json'),
+  JSON.stringify({ accounts: DSH_PROVIDERS.map((p) => ({ provider: p, id: `seed-${p}`, enabled: true })) }),
+)
+
 let failed = 0
 const ok = (cond, msg) => {
   console.log(`${cond ? '✓' : '✗'} ${msg}`)

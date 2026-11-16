@@ -11,6 +11,41 @@
 
 ## 1.0.0（未发布）
 
+- `feat(page)`: **侧栏页加「签到」标签**（2026-11-13）。
+  tab 栏 接入 / 控制台 / **签到** / 设置。magpie 的插件页沙箱（`connect-src 'none'`）
+  决定了这个标签做不了「点了就领」的按钮 —— 它是引导页：控制台地址（与「控制台」
+  标签同源，`conUrl()`，不另写端口）+ 一键复制 + 两步说明（浏览器打开 →
+  buddy 页点「全部领取 + 成长任务」），外加一条**只读**的
+  `usage.autoCheckin` 查询命令（无副作用，可复制到终端跑）。
+  新增 `tests/t-page-checkin.mjs`（tab/panel 成对、节点齐全、命令生成正确、
+  与 fillConsole 同地址源），已登记进 `scripts/test-all.mjs`。
+
+- `feat(console)`: **控制台「全部领取」补上成长中心任务**（2026-11-13）。
+  原先 `creditsClaim()` 只传 `provider`，于是上游 `runTasks` 缺省 false ⇒
+  `afterClaim` 不挂 ⇒ **成长任务永远不跑**，而 vendor 里那份引擎一行不缺。
+  症状是「DSH 有『一键领取积分 + 成长任务』，magpie 只有『全部领取』」，
+  看起来像功能阉割，实际只是适配层漏了一个参数。
+
+  改动三处（都在 `console/`，**不碰 vendor**）：
+  - `console.js` 新增 `GROWTH_TASK_PROVIDERS = Set(['buddy'])` +
+    `GROWTH_BUDGET_MS`（30 分钟，与上游 `DEFAULT_ROUND_BUDGET_MS` 同值）+
+    `CLAIM_IN_FLIGHT` 并发闸（成长一轮数分钟，两轮并发会各自打一遍上游）；
+  - `creditsClaim()` 对名单内的渠道条件展开 `{ runTasks: true, budgetMs }`，
+    其余 28 家请求体与改动前**逐字节一致**（回滚好对照）；
+  - `summarizeGrowth()` 把回包的 `growth` 数组折成「完成 / 需客户端 / 失败 /
+    自动领取 / 预算用尽」五段，口径与 DSH 客户端 `claimCredits` 一致；
+    有失败项或预算用尽时文案标 `.msg.warn`（`console.css` 新增该条，
+    复用既有 `--orange-ink`，不新造颜色变量）。
+
+  ⚠️ `workbuddy`（国际版）**不**进名单 —— 上游实测无任务列表、无 claim 端点。
+  ⚠️ **自动签到仍然不带成长任务**：`credits.claimAll` 同时是「每日首次启动
+  自动签到」的执行体，`runTasks` 在 RPC 层缺省必须保持 false。这次只改了
+  **用户手点**那个按钮。
+
+  新增 `tests/t-console-growth.mjs`（33 项，已登记进 `scripts/test-all.mjs`）：
+  源码守卫（调用点真的传了 `runTasks`）+ 三方名单一致性（console / vendor
+  `afterClaim` / DSH 客户端 `GROWTH_TASK_PROVIDERS`）+ 折叠口径 + 缺席容忍。
+
 - `chore(security)`: **移除运维坐标与凭据，补两道机器守卫**（2026-11-12 安全事件）。
 
   `scripts/deploy-plugin-*.sh`（两个）是**本地部署脚本**，

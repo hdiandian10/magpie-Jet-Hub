@@ -292,6 +292,36 @@ async function saveSettings() {
 
 /* ── tabs ─────────────────────────────── */
 
+/* 「签到」标签的查询命令（只读，无副作用）：
+   POST /api/jet-hub 的 usage.autoCheckin。地址用 conUrl()（与「控制台」标签同一来源：
+   快照探到哪台用哪台，别在这里另写一份 18500 —— 两个端口同时有宿主时会答错机器）。 */
+function checkinCmd() {
+  return `curl -s -X POST ${conUrl().replace(/\/+$/, '')}/api/jet-hub \\` +
+    `\n  -H 'Content-Type: application/json' \\` +
+    `\n  -d '{"type":"client-request","rpcId":"check","method":"jet-hub","payload":{"method":"usage.autoCheckin","payload":{}}}'`
+}
+
+function fillCheckin() {
+  const box = $('#ciUrlBox')
+  if (box) box.value = conUrl()
+  const cmd = $('#ciCmd')
+  if (cmd) cmd.textContent = checkinCmd()
+  // 与 fillConsole 同一条备注逻辑：快照从哪来就说哪，别让用户以为端口写死了。
+  const c = catalog()
+  const at = c.generatedAt || ''
+  const port = String(c.consolePort || CON_PORT_DEFAULT)
+  const note = $('#ciUrlNote')
+  if (!note) return
+  const where = c.consoleFrom === 'probe'
+    ? '快照探活的'
+    : c.consoleFrom === 'file'
+      ? '⚠ 一个宿主都没探通，退回地址文件（可能是死端口）'
+      : '⚠ 快照里没有地址，退回默认值'
+  note.textContent = `${where} :${port}。地址与「控制台」标签同源${at ? `，快照时间 ${at}` : ''}。`
+}
+
+/* ── tabs ─────────────────────────────── */
+
 /* 控制台地址：页面拿不到插件运行时端口（沙箱，connect-src 'none'），
    所以地址由快照脚本一并写进 models.js（`JET_HUB_CATALOG.console`）；
    快照里没有时才退回默认 18500。
@@ -347,6 +377,7 @@ function showTab(name) {
   for (const b of $$('#tabs button')) b.setAttribute('aria-selected', String(b.dataset.tab === name))
   for (const p of $$('.panel')) p.hidden = p.dataset.panel !== name
   if (name === 'console') fillConsole()
+  if (name === 'checkin') fillCheckin()
 }
 
 /* ── 启动 ─────────────────────────────── */

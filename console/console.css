@@ -366,6 +366,10 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .msg { font-size: 12px; color: var(--fg3); }
 .msg.err { color: var(--red); }
 .msg.ok { color: var(--green); }
+/* 部分成功（签到成了但成长有失败 / 时间预算用尽）。用既有 `--orange-ink`
+   而不是新造一个颜色变量：它在本文件里已经是「需要注意但不是故障」的语义
+   （`.creditExpire` / `.relTime` 都用它）。 */
+.msg.warn { color: var(--orange-ink); }
 /* 工具栏里的分组竖线（批量积分操作 | 永久锁定） */
 .barSep { width: 1px; height: 18px; flex: none; background: var(--line); margin: 0 2px; }
 

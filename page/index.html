@@ -23,6 +23,7 @@
 <nav class="tabs" id="tabs" role="tablist">
   <button type="button" data-tab="start" aria-selected="true">接入</button>
   <button type="button" data-tab="console">控制台</button>
+  <button type="button" data-tab="checkin">签到</button>
   <button type="button" data-tab="settings">设置</button>
 </nav>
 
@@ -122,6 +123,51 @@
       <li><code>登录</code><span>— 起设备码/浏览器登录取凭据，直接落进账号池</span></li>
       <li><code>积分</code><span>— 查每个账号的积分余额、每日领取、领取记录</span></li>
       <li><code>备份</code><span>— 账号池导出 / 导入，换机器搬运用</span></li>
+    </ul>
+  </div>
+</section>
+
+<!-- ───────────── 签到 ───────────── -->
+<section class="panel" data-panel="checkin" hidden>
+  <div class="card">
+    <h2>每日签到与成长任务</h2>
+    <p class="hint">
+      每日签到由 magpie 宿主每天自动跑一次（本页不用管）。
+      <strong>成长中心任务</strong>是手动动作 —— 本页被 magpie 沙箱成
+      <code>connect-src 'none'</code>，点不了真的按钮，所以在浏览器里做，两步：
+    </p>
+    <ol class="feats" style="padding-left:18px;margin:6px 0">
+      <li>点下面的按钮复制控制台地址，粘到浏览器打开；</li>
+      <li>左侧选 <b>CodeBuddy (腾讯)</b> → 点 <b>「全部领取 + 成长任务」</b>。</li>
+    </ol>
+    <div class="field">
+      <label for="ciUrlBox">控制台地址</label>
+      <input class="wide" id="ciUrlBox" readonly value="http://127.0.0.1:18500/" />
+      <button type="button" id="ciCopy" data-copy="#ciUrlBox">复制地址</button>
+    </div>
+    <p class="hint" id="ciUrlNote">
+      端口默认 <code>18500</code>，与「控制台」标签里的地址同源（快照探到哪台用哪台）。
+      一轮成长任务单账号 90～270 秒、全串行，跑不完会提示「再点一次继续剩余项」，进度是服务端记的。
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>自动签到现在是什么状态</h2>
+    <p class="hint" id="ciAutoState">本页读不到运行状态（沙箱不许联网）—— 打开控制台的「概览」页看「每日签到」卡片，或用下面的命令行查一次。</p>
+    <div class="snip">
+      <button class="mini corner" type="button" data-copy="#ciCmd">复制</button>
+      <pre id="ciCmd"></pre>
+    </div>
+    <p class="hint">上面这条命令查「今天跑没跑、各渠道领到没有」，直接在终端粘回车即可，无副作用。</p>
+  </div>
+
+  <div class="card">
+    <h2>哪些渠道有什么</h2>
+    <ul class="reads">
+      <li><code>自动签到</code><span>— 每天一次，magpie 宿主自己跑，覆盖全部有签到接口的渠道</span></li>
+      <li><code>全部领取</code><span>— 控制台手动点，等于自动签到那轮，28 家照旧</span></li>
+      <li><code>+ 成长任务</code><span>— 只有 buddy（CodeBuddy 腾讯）有成长中心，按钮在它那页才多这几个字</span></li>
+      <li><code>新人奖励 / 补偿</code><span>— 也是控制台账号页的手动按钮，分别只在 4 家 / buddy 出现</span></li>
     </ul>
   </div>
 </section>

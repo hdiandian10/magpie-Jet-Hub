@@ -1213,6 +1213,140 @@ const BALANCE_TIERED_PROVIDERS = new Set([
   'minimax', 'minimaxintl', 'autoclaw', 'autoclawintl', 'magicrew', 'magicrewintl', 'astudio',
 ])
 
+/**
+ * 有「成长中心任务」实现的渠道 —— 决定「领取 + 成长任务」按钮渲不渲染。
+ *
+ * ⚠️ 必须与上游两处**同时**一致，漏一处就是点了必然失败的按钮：
+ *   1. `vendor/lib/provider-credits.js` 的 `afterClaim`（只有 buddy 挂了实现）；
+ *   2. `vendor/lib/client/jet-hub.js` 的 `GROWTH_TASK_PROVIDERS`（DSH 客户端
+ *      决定是否传 `runTasks` 的那张表，取值同样是 `Set(['buddy'])`）。
+ *
+ * ⚠️ WorkBuddy（国际版）**没有**成长中心 —— 上游实测无任务列表、无 claim 端点。
+ * 所以这张表**不是**「buddy / workbuddy 专有」，别顺手把 workbuddy 加进来。
+ *
+ * ⚠️ `runTasks` 在 RPC 层缺省为 false（`vendor/lib/types.d.ts` 的
+ * `RpcCreditsClaimAllRequest.runTasks` 注释写死了这条），原因是
+ * `credits.claimAll` 同时是「每日首次启动自动签到」的执行体，而成长一轮单账号
+ * 实测 90～270s、全串行。只有用户**手点**这个按钮时才传 true。
+ */
+const GROWTH_TASK_PROVIDERS = new Set(['buddy'])
+
+/**
+ * 成长任务单账号时间预算（毫秒）。
+ *
+ * 30 分钟 = 上游 `DEFAULT_ROUND_BUDGET_MS`（`vendor/lib/jet-hub-rpc.js`）。
+ * 传 0 会变成「不限时」，那会让一个卡住的账号把整个请求拖到浏览器超时 —— 别传 0。
+ */
+const GROWTH_BUDGET_MS = 30 * 60 * 1000
+
+/** 「领取 + 成长任务」一轮的进行中标记（按钮 disabled 之外的第二道闸）。 */
+let CLAIM_IN_FLIGHT = false
+
+/**
+ * 把 `credits.claimAll` 回包里的 `growth` 数组折成「一句话 + 逐项明细」。
+ *
+ * 与 DSH 客户端（`vendor/lib/client/jet-hub.js` 的 claimCredits）**同口径**：
+ * 完成 / 需客户端 / 失败三项分开数，`timedOut` 单独提示「再点一次即可继续」。
+ * 折成一句会丢掉逐项判据，而「为什么这项没涨」只能从明细里看出来。
+ *
+ * ⚠️ `growth` 只在请求方传了 `runTasks: true` 且该渠道有实现时才出现 ——
+ * 缺席是**正常**（不是失败），所以返回 null 让调用方整段跳过。
+ */
+function summarizeGrowth(growth) {
+  if (!Array.isArray(growth) || growth.length === 0) return null
+  // ⚠️ **不**直接累加回包里的 `account.completed`。
+  //
+  // 实测（2026-11-13，buddy 两个账号真跑一轮）该字段与逐项明细**对不上**：
+  // `completed: 1`，而同账号的 `tasks` 里 `ok && !clientOnly` 有 3 条
+  //（`RichMeow_Chat` / `(首Buddy)` / `(保连胜)`）。上游 DSH 客户端正是
+  // 拿 `completed` 写汇总、拿 `settled.length` 写明细 —— 于是它自己的两行字
+  // 互相矛盾（「完成 2 项」下面列着「完成 3 项」）。这里改成**统一按明细数**，
+  // 让汇总与明细必然自洽。
+  //
+  // ⚠️ 同理**不**直接累加 `account.failed`：「预算用尽 ⇒ 未执行」的项在上游
+  // 也是 `ok: false`，会被算进 failed。实测一轮 90s 预算下 `failed: 11` 里有 9 条
+  // 是「本轮时间预算已用尽，未执行」—— 把它们报成「失败」会让用户以为任务坏了。
+  // 故按 `message` 把 broken 再分成「未执行」与「真失败」两堆。
+  let completed = 0
+  let clientOnly = 0
+  let failed = 0
+  let notRun = 0
+  let claimedCount = 0
+  let claimedCredit = 0
+  let timedOut = false
+  const details = []
+  for (const account of growth) {
+    const who = account?.nickname || account?.accountId || '?'
+    clientOnly += account?.clientOnly || 0
+    claimedCount += account?.claimedCount || 0
+    claimedCredit += account?.claimedCredit || 0
+    if (account?.timedOut) timedOut = true
+    if (account?.error) {
+      details.push(`${who}：${account.error}`)
+      continue
+    }
+    const tasks = Array.isArray(account?.tasks) ? account.tasks : []
+    const settled = tasks.filter((t) => t?.ok && !t?.clientOnly)
+    const needClient = tasks.filter((t) => t?.ok && t?.clientOnly)
+    const broken = tasks.filter((t) => !t?.ok)
+    const skipped = broken.filter((t) => isNotRunTask(t))
+    const realBroken = broken.filter((t) => !isNotRunTask(t))
+    completed += settled.length
+    failed += realBroken.length
+    notRun += skipped.length
+    if (settled.length === 0 && broken.length === 0) {
+      const why =
+        needClient.length > 0
+          ? `${needClient.length} 项判据只在客户端行为里记录，API 推不动`
+          : '本轮无 API 可达的任务'
+      details.push(`${who}：${why}（未领到积分）`)
+      continue
+    }
+    const head = [
+      settled.length > 0 ? `完成 ${settled.length} 项` : null,
+      realBroken.length > 0 ? `失败 ${realBroken.length} 项` : null,
+      needClient.length > 0 ? `需客户端 ${needClient.length} 项` : null,
+      skipped.length > 0 ? `未执行 ${skipped.length} 项` : null,
+    ]
+      .filter(Boolean)
+      .join('，')
+    details.push(`${who}：${head}`)
+    for (const task of settled.concat(realBroken)) {
+      const label = task?.taskCode || '未知任务'
+      const reason = task?.message || ''
+      details.push(task?.ok ? `　· ${label}：${reason}` : `　· ${label}：失败 — ${reason}`)
+    }
+    // 「未执行」单独归一行，不逐条铺开 —— 它们的原因全都是同一句「预算用尽」，
+    // 逐条列会把真正的失败淹掉（实测 31 条明细里有 20 条是这句）。
+    if (skipped.length > 0) {
+      details.push(`　· 未执行 ${skipped.length} 项：${skipped[0]?.message || '本轮预算用尽'}`)
+    }
+  }
+  const parts = []
+  if (completed > 0) parts.push(`成长完成 ${completed} 项`)
+  if (clientOnly > 0) parts.push(`成长需客户端 ${clientOnly} 项`)
+  if (failed > 0) parts.push(`成长失败 ${failed} 项`)
+  if (notRun > 0) parts.push(`未执行 ${notRun} 项`)
+  if (claimedCount > 0) parts.push(`自动领取 ${claimedCount} 项（+${formatCreditAmount(claimedCredit)} 积分）`)
+  if (timedOut) parts.push('本轮时间预算用尽，剩余项未执行，再点一次即可继续')
+  return { text: parts.join('，'), details, failed, notRun, timedOut }
+}
+
+/**
+ * 这条 `ok:false` 的任务是「预算用尽没轮到」，还是**真失败**？
+ *
+ * 上游把两者都写成 `ok: false`，只有 `message` 能区分（`buddy-growth.ts` 的
+ * 两处文案：「本轮时间预算已用尽，未执行（点一次按钮可继续）」与
+ * 「扫尾补领触及时间预算，本轮还有 N 项未执行」）。
+ *
+ * ⚠️ 判据必须窄：只认「时间预算」与「未执行」这两个短语。泛化成「含预算」
+ * 会把真失败里恰好提到预算的项也吞掉。
+ */
+function isNotRunTask(task) {
+  const msg = String(task?.message ?? '')
+  return msg.includes('时间预算') || msg.includes('未执行')
+}
+
 function syncProxyButtons() {
   const provider = $('#accProvider').value
   const anon = $('#accAnon')
@@ -1222,7 +1356,18 @@ function syncProxyButtons() {
   // 「严格手动顺序」只对分档渠道渲染 —— 与 `#accAnon` / `#accProxy` 同一套隐藏约定。
   const sw = $('#accStrictWrap')
   if (sw) sw.hidden = !BALANCE_TIERED_PROVIDERS.has(provider)
+  // 按钮文案跟着渠道走：只有 buddy 有成长中心，其余 28 家照旧叫「全部领取」。
+  // ⚠️ 文案是**唯一**能让用户知道「这一家会不会跑成长任务」的地方（按钮本身
+  //    在 29 家都渲染，隐藏它会让用户以为那家没签到）。
+  const claim = $('#credClaim')
+  if (claim && !CLAIM_IN_FLIGHT) {
+    claim.textContent = GROWTH_TASK_PROVIDERS.has(provider) ? '全部领取 + 成长任务' : '全部领取'
+    claim.title = GROWTH_TASK_PROVIDERS.has(provider)
+      ? '领取该渠道全部账号的每日签到积分，并执行成长中心任务。成长一轮单账号可达数分钟（全串行），跑不完可再点一次继续。'
+      : '领取该渠道全部账号（含已停用）的每日签到积分'
+  }
 }
+
 
 /**
  * 把「严格手动顺序」开关的勾选态与本体对齐（本体选号路径**每次现读**这份开关，
@@ -1697,13 +1842,42 @@ function formatClaimGains(totals) {
 
 async function creditsClaim(btn) {
   const provider = $('#accProvider').value
+  // 成长任务一轮可能数分钟（单账号 90～270s，全串行），与 DSH 客户端一样
+  // 禁止并发点第二次 —— 否则两轮会各自打一遍上游，还都写同一个水位线。
+  if (CLAIM_IN_FLIGHT) {
+    say('#credMsg', '上一次领取仍在进行中（成长任务一轮可能数分钟），请等它结束。', 'warn')
+    return
+  }
+  // ⚠️ 是否带成长任务**按渠道判**（`GROWTH_TASK_PROVIDERS`），不按按钮判。
+  //    `runTasks` 在 RPC 层缺省 false，只有这里显式传 true 才会挂 `afterClaim`。
+  const withTasks = GROWTH_TASK_PROVIDERS.has(provider)
+  CLAIM_IN_FLIGHT = true
   try {
     await busy(btn, async () => {
-      const v = await rpc('credits.claimAll', { provider })
+      say('#credMsg', withTasks ? '领取中…（含成长任务，可能要几分钟）' : '领取中…')
+      const v = await rpc('credits.claimAll', {
+        provider,
+        // 非成长渠道**不传**这两个键：`undefined` 会被 JSON 丢掉，但显式传 false
+        // 也会在上游门控里被 `!== true` 拦下 —— 两种写法等价，这里选「不传」，
+        // 让请求体与改动前逐字节一致（回滚时好对照）。
+        ...(withTasks ? { runTasks: true, budgetMs: GROWTH_BUDGET_MS } : {}),
+      })
       renderGeneric($('#credOut'), v)
       const s = v?.summary
       const gained = formatClaimGains(s?.totalByUnit)
-      say('#credMsg', s ? `领取 ${s.claimed} 个${gained === null ? '' : `，${gained}`}；已领 ${s.alreadyClaimed ?? 0}，失败 ${s.failed ?? 0}` : '已执行领取', 'ok')
+      const growth = summarizeGrowth(v?.growth)
+      const head = s
+        ? `领取 ${s.claimed} 个${gained === null ? '' : `，${gained}`}；已领 ${s.alreadyClaimed ?? 0}，失败 ${s.failed ?? 0}`
+        : '已执行领取'
+      // 成长摘要追加在同一行（用户要求「一句话读完」，明细靠 `#credOut` 的原始回包）。
+      const tail = growth && growth.text !== '' ? `；${growth.text}` : ''
+      // ⚠️ 时间预算用尽**不算失败**（`failed` 里已经混进了「未执行」的项），
+      //    所以判定用「有真失败 或 预算用尽」⇒ 需要用户注意但不是故障，标 warn。
+      const warn = (s?.failed ?? 0) > 0 || (growth?.failed ?? 0) > 0 || growth?.timedOut === true
+      // 预算用尽时把「再点一次」并进同一行 —— 分成两次 `say()` 会互相覆盖
+      //（`say` 是 `textContent = …`，后一次直接把前一次冲掉，用户只看到后半句）。
+      const resume = growth?.timedOut ? '（再点一次继续剩余项）' : ''
+      say('#credMsg', `${head}${tail}${resume}`, warn ? 'warn' : 'ok')
       // 领完卡片上的数字就过期了，重拉一次（也要重拉余额，不然还停在这轮之前）。
       // 期间切了渠道就别渲染了 —— 新渠道的 `ACC` 还没拉，会闪一帧空列表。
       if ($('#accProvider').value !== provider) return
@@ -1717,6 +1891,12 @@ async function creditsClaim(btn) {
     })
   } catch (e) {
     say('#credMsg', String(e.message ?? e), 'err')
+  } finally {
+    CLAIM_IN_FLIGHT = false
+    // 期间用户可能切了渠道 —— 按钮文案是按渠道算的（buddy 才有成长任务），
+    // 而 `busy()` 恢复的是**开跑时**那句文案。不重算的话会停在上一家的叫法上，
+    // 直到下一次切渠道才纠正。
+    syncProxyButtons()
   }
 }
 

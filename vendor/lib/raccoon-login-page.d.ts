@@ -15,8 +15,11 @@
  *   POST /raccoon/sms/verify  → 提交验证码完成登录
  * ```
  *
- * 微信扫码的 `code` 由**宿主侧本地随机生成**（实测服务端接受任意自造 code
- * 并进入 `pending`），完全绕开那个收不到的自定义协议回调。
+ * 微信扫码的 `code` 由 **IAM 服务端签发**（`POST /api/iam/v1/auth/mp/qrcode`）。
+ *
+ * ⚠️ 2026-11-14 起**不能**再本地随机生成：旧端点
+ * `/api/web/auth/v1/login_with_qrcode_code` 已成僵尸（对任意字符串恒回
+ * `pending`、不再推进状态），新端点会直接拒发非签发 code（Gitee IKVA90）。
  *
  * ## 与其余 provider 的契约一致性
  *
@@ -32,6 +35,7 @@
  * - 手机号加密在宿主侧的 `/raccoon/sms/send` 里完成
  */
 import { type RaccoonCredential } from './raccoon.js';
+import { type RaccoonQrTicket } from './raccoon-oauth.js';
 import { type RaccoonProduct } from './raccoon-product.js';
 /** 本地登录页的路径。 */
 export declare const RACCOON_LOGIN_PAGE_PATHS: {
@@ -76,9 +80,10 @@ export declare function startRaccoonLoginFlow(options?: RaccoonLoginFlowOptions)
  * - 每 2 秒轮询 `/raccoon/poll`（与官方客户端一致）
  * - 短信 Tab 加载阿里云滑块脚本，拿到 `captchaParam` 后提交
  *
- * @param qrCode 当前会话的扫码 code（宿主侧生成）。**注意**：本函数只是把它
- *   渲染成二维码 —— 页面拿不到 code 本身（它被编码进二维码图像里）。
+ * @param ticket 当前会话的**服务端签发**票据。**注意**：本函数只是把它渲染成
+ *   二维码 —— 页面拿不到 `qrcode_code` 本身（它被编码进二维码图像里）。
  *   这符合职责边界：页面不需要知道 code，只需要展示。
+ * @param error 申请票据失败的原因（有值时二维码区域改为可读错误 + 短信兜底提示）。
  */
-export declare function renderRaccoonLoginPage(product: RaccoonProduct, qrCode?: string): string;
+export declare function renderRaccoonLoginPage(product: RaccoonProduct, ticket?: RaccoonQrTicket, error?: string): string;
 //# sourceMappingURL=raccoon-login-page.d.ts.map

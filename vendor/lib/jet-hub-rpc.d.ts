@@ -334,7 +334,12 @@ export interface CreditsEndpointDeps<TCredential = BuddyCredential, TProduct = B
      * - **永不抛**：抽奖是不可逆写操作且会因「今日已参与 / 窗口外 / 无资格」失败，
      *   那些都**不是**签到失败（本仓库有两轮「登录成功却因记账失败被报成失败」事故史）。
      *
-     * ⚠️ 只有 trae 注入；其余 provider 不传 ⇒ 行为逐字不变。
+     * ⚠️ 目前有两家注入：`trae`（抽奖）与 `workbuddy` 国际版（活跃上报）。
+     * ⚠️ **第四参 `outcome` 是必需的**（PR #87 审计 P1-1/P1-2）：接线层要是只映射
+     * 前三个参数，实现里两种结局（`inactive` / `failed`）与两种执行
+     * （`claimed` / `already-claimed`）行为会**逐字相同** —— 领取失败照样产生
+     * 用户可见副作用（在人家账号里建会话），而且日志零字，结构上查不出来。
+     * 其余 provider 不传 ⇒ 行为逐字不变。
      */
     afterClaimNote?: (credential: TCredential, product: TProduct, entry: ProviderAccountEntry, outcome: ClaimOutcome) => Promise<string | undefined>;
     /** 查询积分余额；默认使用真实的 fetchCreditBalance。 */

@@ -85,7 +85,7 @@ export interface LoomyAdapterOptions {
      * `AccountPool.getAvailableAccount` 的 `modelId` —— 早期实现传空串
      * （等于不按模型过滤），会让模型级限流失效。
      */
-    resolveCredential: (modelId?: string) => Promise<LoomyCredential | undefined>;
+    resolveCredential: (modelId?: string, sessionId?: string) => Promise<LoomyCredential | undefined>;
     /**
      * 凭据失效时的处理。
      *

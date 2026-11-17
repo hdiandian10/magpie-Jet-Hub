@@ -527,10 +527,10 @@ export class RaccoonAdapter extends LlmAdapter {
             }
         }
         // 1. 取凭据（过期则先续期）
-        let credential = await this.options.resolveCredential(options.model);
+        let credential = await this.options.resolveCredential(options.model, options.sessionId);
         if (credential === undefined || isRaccoonExpired(credential)) {
             await this.options.refresh();
-            credential = await this.options.resolveCredential(options.model);
+            credential = await this.options.resolveCredential(options.model, options.sessionId);
         }
         if (credential === undefined || credential.access_token.length === 0) {
             throw new LlmError('raccoon: no usable credential; log in first', 'MISSING_CREDENTIAL');
@@ -645,7 +645,7 @@ export class RaccoonAdapter extends LlmAdapter {
         // 401/403 时续期一次并重试（raccoon 有 refresh_token 轮换）。
         if (response.status === 401 || response.status === 403) {
             await this.options.refresh();
-            const refreshed = await this.options.resolveCredential(options.model);
+            const refreshed = await this.options.resolveCredential(options.model, options.sessionId);
             if (refreshed === undefined || refreshed.access_token.length === 0) {
                 throw new LlmError('raccoon: credential expired and refresh failed', 'AUTH', { status: response.status });
             }

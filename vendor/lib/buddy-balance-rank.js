@@ -292,6 +292,86 @@ export function splitBuddyCreditsByExpiry(balance, now = Date.now(), windowMs = 
     return { expiring, permanent, ...expired > 0 ? { expired } : {} };
 }
 /**
+ * 「轮换起点」的**唯一实现**：把已排好序的候选从指定账号处绕一圈。
+ *
+ * ## 语义（用户 2026-11-10 需求）
+ *
+ * ```
+ * 策略顺序：A → B → C → D →（回到 A）
+ * 选 C 后： C → D → A → B →（回到 C）
+ * ```
+ *
+ * ⚠️ **只挪起点，不改任何策略**：
+ * - 档位判据照旧（临期优先仍然成立）；
+ * - 可用性过滤照旧（锁定永久积分时「只剩永久」仍不可用）；
+ * - 失败换号照旧（`tried` 循环在旋转后的数组上跑）。
+ *
+ * ## ⚠️ 起点落在「往后第一个可用项」
+ *
+ * 用户选的号**可能当前不可用**，分两种成因，**都必须循环到下一个可用**、
+ * 不能回落默认（用户明确要求）：
+ *
+ * 1. **在候选集里但档位不可用**（`none` 档）—— 向后扫时跳过；
+ * 2. **压根不在候选集里**（账号级封禁 / 目标模型限流，被 `candidatesOf` 滤掉）
+ *    —— 此时只按 `ranked.findIndex(id)` 会得到 `-1`，于是**静默回落默认第一个号**
+ *    （恰是用户想避开的）。PR #59 正向审计 P1-a 实测。
+ *
+ * 成因 2 的修法：调用方额外传 {@link BuddyTierOptions.enabledAccountIds}
+ * （**全量启用账号**的 id 列表，池序、不过滤封禁/限流）。本函数据它算出起点
+ * 的**池位次**，再从候选里取「池位次 ≥ 起点」的第一个 —— 候选是按策略序
+ * 排的，故那个就是「起点之后」的第一个候选。
+ *
+ * ## 三条不变量
+ *
+ * 1. **集合不变**：只旋转，不增删（长度与元素身份都不变）；
+ * 2. **保序**：起点之后 / 之前的各自保持原相对顺序；
+ * 3. **找不到就原样**：`rotationStartId` 指向的账号**已被删除**（不在
+ *    `enabledAccountIds` 里）⇒ 与未设置**逐字节相同**，不报错。
+ *    ⚠️ 与「起点被封禁/限流」**刻意区分**：后者账号还在，用户的选择仍有意义，
+ *    故循环到下一个可用；前者选择已无处可指，回落默认才是唯一合理语义。
+ *
+ * @param ranked - **已按策略排好序**的候选（⚠️ 必须排在旋转之前）
+ * @param options - 与排序同一份选项（需要 `allowPermanent` 判可用性，
+ *   可选 `enabledAccountIds` 定位「不在候选里的起点」）
+ * @returns **新数组**
+ */
+export function rotateFromPreferred(ranked, options = {}) {
+    const startId = options.rotationStartId;
+    if (startId === undefined || startId.length === 0)
+        return [...ranked];
+    const directIndex = ranked.findIndex((account) => account.id === startId);
+    const enabledAccountIds = options.enabledAccountIds ?? [];
+    let index = directIndex;
+    if (index < 0) {
+        // 成因 2：起点不在候选集里。先在全量启用账号里定位它的池位次。
+        const startPosition = enabledAccountIds.indexOf(startId);
+        // 不变量 3：账号已被删除 ⇒ 原样（= 默认起点）。
+        if (startPosition < 0)
+            return [...ranked];
+        // 候选按策略序排；「池位次 ≥ 起点」的第一个就是「起点之后」的第一个候选。
+        index = ranked.findIndex((account) => enabledAccountIds.indexOf(account.id) >= startPosition);
+        // 起点是最后一位、其后没有候选 ⇒ 绕回开头（循环语义）。
+        if (index < 0)
+            index = 0;
+    }
+    // ⚠️ 从 index 起**向后**找第一个可用项（step = 0 时先检查自己）。
+    let anchor = -1;
+    for (let step = 0; step < ranked.length; step += 1) {
+        const at = (index + step) % ranked.length;
+        if (buddyTierUsable(buddyBalanceTier(ranked[at], options))) {
+            anchor = at;
+            break;
+        }
+    }
+    // 全不可用 ⇒ 原样，交给上层报出真实原因（不要在这里抛）。
+    if (anchor < 0)
+        return [...ranked];
+    // 起点已是首位 ⇒ 无需旋转（但仍返回新数组，保持「不改入参」约定）。
+    if (anchor === 0)
+        return [...ranked];
+    return [...ranked.slice(anchor), ...ranked.slice(0, anchor)];
+}
+/**
  * 判定单个账号的档位。
  *
  * ⚠️⚠️ **入参必须是「已分桶」的形状，不是 `CreditBalance`**（2026-11-01 三审实测踩到）：

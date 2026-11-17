@@ -39,6 +39,116 @@ import Schema from '@deepseek-ai/schemastery';
 import { hasLegacyNamespaceRegistration, readService, settingsOf } from './settings-compat.js';
 /** Jet Hub schema namespace（老契约的 settings 命名空间名）。 */
 export const JET_HUB_NS = 'jet-hub';
+/**
+ * 每个 provider 最多保留多少个**会话**的轮换起点（超出时淘汰 `at` 最小的）。
+ *
+ * 取 64：正常用户同时活跃的会话是个位数；64 足以覆盖「忘了关的旧会话」，
+ * 而单条 ≈ 100 字节 ⇒ 单 provider 至多 ≈ 6 KB。
+ */
+export const PREFERRED_ROTATION_MAX_SESSIONS = 64;
+/**
+ * 归一化「轮换起点」表（{@link JetHubState.preferredRotation}）。
+ *
+ * 判据：非对象/数组 ⇒ 空表；provider 或 sessionId 为空串 ⇒ 丢弃；
+ * 值必须是非空字符串；**清完后为空的层一并丢弃**（不留空对象）。
+ *
+ * ⚠️ **读写两侧都要调用**（与本仓 `sanitizeStrictManualOrder` 同款）：
+ * 老契约后端不经过 schema，只靠这个函数。
+ */
+export function sanitizePreferredRotation(raw) {
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw))
+        return {};
+    const result = {};
+    for (const [provider, sessions] of Object.entries(raw)) {
+        if (provider.length === 0)
+            continue;
+        if (typeof sessions !== 'object' || sessions === null || Array.isArray(sessions))
+            continue;
+        const clean = {};
+        for (const [sessionId, entry] of Object.entries(sessions)) {
+            if (sessionId.length === 0)
+                continue;
+            /**
+             * ⚠️ **三种历史形态都要认**（任一丢弃都是「静默丢用户数据」）：
+             *
+             * | 形态 | 来源 |
+             * |---|---|
+             * | 裸字符串 ``"accountId"`` | 本功能最早那一版（无 ``at``） |
+             * | ``{ accountId, at }`` | 早期版本 |
+             * | ``{ position, at }`` | **本版起** |
+             *
+             * ⚠️ 裸字符串补 ``at = 0``（= 最旧，淘汰时最先丢，符合直觉）。
+             */
+            if (typeof entry === 'string') {
+                if (entry.length === 0)
+                    continue;
+                clean[sessionId] = { accountId: entry, at: 0 };
+                continue;
+            }
+            if (typeof entry !== 'object' || entry === null || Array.isArray(entry))
+                continue;
+            const record = entry;
+            const at = record.at;
+            // ``at`` 必须是非负有限数（淘汰要按它排序）
+            if (typeof at !== 'number' || !Number.isFinite(at) || at < 0)
+                continue;
+            // ⚠️ 新格式优先认 ``position``；位次必须是正整数（1-based）
+            const position = record.position;
+            if (typeof position === 'number' && Number.isInteger(position) && position >= 1) {
+                clean[sessionId] = { position, at };
+                continue;
+            }
+            // 旧格式 ``{ accountId, at }`` —— 保留（换算成位次需要账号池，本层看不到）
+            const accountId = record.accountId;
+            if (typeof accountId !== 'string' || accountId.length === 0)
+                continue;
+            clean[sessionId] = { accountId, at };
+        }
+        if (Object.keys(clean).length === 0)
+            continue;
+        // ⚠️ 淘汰放在**读取侧**也做一次：老文档（超上限）读进来时就收敛，
+        //    不必等下一次写入。与 `prunePreferredRotation` 同源。
+        result[provider] = prunePreferredRotation(clean);
+    }
+    return result;
+}
+/**
+ * 按 {@link PREFERRED_ROTATION_MAX_SESSIONS} 淘汰最旧的会话（按 ``at`` 升序丢前面的）。
+ *
+ * ⚠️ **纯函数**：返回新对象，不改入参（与 `sanitizePreferredRotation` 同约定）。
+ * ⚠️ `limit <= 0` ⇒ 返回空表（确定性结果，不是「全留」）。
+ *
+ * ⚠️ **`at` 完全相同时**（同一毫秒内连续写入多条）：淘汰结果依赖 `Object.keys`
+ *    的插入顺序 —— `Array.prototype.sort` 在 ES2019+ 是稳定的，故**实测确定**。
+ *    但这依赖「字符串键按插入序」这个实现细节，不是语言规范保证。
+ *    ⇒ 刻意不为此加 tie-breaker：那些条目是**同一时刻的操作**，
+ *      丢哪条都会让它回落到「默认」，用户无感。
+ */
+/**
+ * 取条目的 ``at``（淘汰排序用）。
+ *
+ * ⚠️ **裸字符串（最老格式）没有 ``at``** ⇒ 统一当 0（= 最旧，淘汰时最先丢）。
+ *    用 ``typeof`` 收窄而不是直接 ``.at`` —— 后者对字符串是 ``undefined``，
+ *    参与算术会得到 ``NaN``，排序行为不可预期。
+ */
+function atOf(entry) {
+    return typeof entry === 'string' ? 0 : entry.at;
+}
+export function prunePreferredRotation(sessions, limit = PREFERRED_ROTATION_MAX_SESSIONS) {
+    const keys = Object.keys(sessions);
+    if (limit <= 0)
+        return {};
+    if (keys.length <= limit)
+        return { ...sessions };
+    // 按 `at` 升序（旧的在前）排序后取末尾 limit 个 —— **保留最新的**。
+    const kept = keys
+        .sort((a, b) => atOf(sessions[a]) - atOf(sessions[b]))
+        .slice(keys.length - limit);
+    const result = {};
+    for (const key of kept)
+        result[key] = sessions[key];
+    return result;
+}
 /** {@link PanelEntry} 的合法取值，也是 RPC 写入侧的校验表（唯一真源）。 */
 export const PANEL_ENTRY_VALUES = ['sidebar', 'settings'];
 /** 缺键 / 脏值 / 老文档迁移时的默认入口。 */
@@ -65,6 +175,7 @@ export const jetHubSchema = Schema.object({
     disabledModels: Schema.dict(Schema.any()).default({}),
     loomyPermanentLocked: Schema.boolean().default(false),
     gatewayEnabled: Schema.boolean().default(true),
+    qoderTrafficGuard: Schema.dict(Schema.any()).default({}),
     // 「允许局域网访问」：默认关闭（暴露面变大必须是显式选择）。
     gatewayAllowLan: Schema.boolean().default(false),
     nativeWebSearchEnabled: Schema.boolean().default(true),
@@ -78,6 +189,9 @@ export const jetHubSchema = Schema.object({
     // ⚠️ 绝不能写成 `Schema.boolean().default(false)` —— 它是**按 provider 的稀疏表**，
     //   不是全局布尔；写成布尔会把「只给某一家开」这件事从数据形状上抹掉。
     strictManualOrder: Schema.dict(Schema.any()).default({}),
+    // 「轮换起点」：**默认空表** = 升级前行为。schema 只负责类型，合法性由
+    // sanitizePreferredRotation 读写两侧统一判（与上一行同款）。
+    preferredRotation: Schema.dict(Schema.any()).default({}),
     // 缺键 = 「仅侧栏」（升级前的默认就是显示那一行；改掉是显式动作）。
     // ⚠️ 用 `Schema.string()` 而不是 `Schema.union([...])`：schema 只负责类型，
     // 取值合法性由 `sanitizePanelEntry` 在**读写两侧**统一判（老契约后端不经过
@@ -116,6 +230,15 @@ export const jetHubSchema = Schema.object({
  */
 export function sanitizeGatewayEnabled(raw) {
     return raw !== false;
+}
+export function sanitizeQoderTrafficGuard(raw) {
+    if (raw === null || typeof raw !== 'object')
+        return {};
+    const { qoder, qodercn } = raw;
+    return {
+        ...(typeof qoder === 'boolean' ? { qoder } : {}),
+        ...(typeof qodercn === 'boolean' ? { qodercn } : {}),
+    };
 }
 /**
  * 归一化「允许局域网访问」开关。
@@ -861,6 +984,7 @@ class SettingsStore {
             loomyPermanentLocked: value.loomyPermanentLocked === true,
             // 老文档没这个键 → 启用，与升级前行为一致。
             gatewayEnabled: sanitizeGatewayEnabled(value.gatewayEnabled),
+            qoderTrafficGuard: sanitizeQoderTrafficGuard(value.qoderTrafficGuard),
             // 老文档没这个键 → 关闭（安全默认：暴露面变大必须是显式选择）。
             gatewayAllowLan: sanitizeGatewayAllowLan(value.gatewayAllowLan),
             // 老文档没这个键 → 启用（原生搜索本就是新功能，默认开启才符合「装上就能用」）。
@@ -869,6 +993,7 @@ class SettingsStore {
             sessionBalanceEnabled: sanitizeSessionBalanceEnabled(value.sessionBalanceEnabled),
             // 老文档没这个键 → 空表（= 全部走余额分档，升级前行为）。
             strictManualOrder: sanitizeStrictManualOrder(value.strictManualOrder),
+            preferredRotation: sanitizePreferredRotation(value.preferredRotation),
             // 老文档没新键 → 按老布尔迁移（只有明确 false 才是「仅设置页」）；两者都没有 → 仅侧栏。
             panelEntry: sanitizePanelEntry(value.panelEntry, value.sidebarEntryEnabled),
             // 老文档没这个键 → 空数组（未自定义），展示侧按声明顺序渲染。
@@ -907,6 +1032,7 @@ class SettingsStore {
             loomyPermanentLocked: state.loomyPermanentLocked === true,
             // 开关丢失只会让网关回到默认启用（可逆），故接受老版本重写时丢掉本键。
             gatewayEnabled: state.gatewayEnabled !== false,
+            qoderTrafficGuard: sanitizeQoderTrafficGuard(state.qoderTrafficGuard),
             // ⚠️ **必须带上本键**（与上一行同因）：`replace` 是整体替换语义 —— 漏键会让
             // 用户打开的「允许局域网访问」在任何一次其它写入时被抹掉，重启后**静默
             // 回到只绑回环**（可逆但用户会以为坏了）。缺键语义为关闭（安全默认）。
@@ -929,6 +1055,7 @@ class SettingsStore {
             //    症状极难归因：用户只会看到「拖拽又不灵了」，而面板序号还停在 1。
             //    过一遍 sanitize：入参可能来自任何调用方，脏值不该被写进文档。
             strictManualOrder: sanitizeStrictManualOrder(state.strictManualOrder),
+            preferredRotation: sanitizePreferredRotation(state.preferredRotation),
             // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同因，是同一个
             //    `replace` 整体替换陷阱的第二个受害者）：漏键会让用户改过的
             //    「面板入口」在**任何**一次账号/黑名单/网关/顺序写入时被抹掉，
@@ -1105,6 +1232,13 @@ const REF_PREFIX_TO_PROVIDER = [
     //    顺序由 `ACCOUNT_REF_RE` 内部的**长度降序排序**保证，与本数组书写顺序无关
     //    （与 `MINIMAX` / `MINIMAXINTL` 同型）。
     ['AUTOCLAWINTL', 'autoclawintl'],
+    // ⚠️ **本 fork 独有**（豆包，2026-10-29）—— 同款坑第 **十** 次。
+    // ⚠️ 本次是**由守卫抓出来的**（`jet-hub-store.spec.ts` 的
+    //    「恢复表覆盖客户端 PROVIDERS 的全部 provider」当场红、并点名 doubao）：
+    //    豆包接入时漏登记本表 ⇒ `DOUBAO_ACCOUNT_*` 的账号在 `state.json` 缺失时
+    //    **静默消失**（凭据还在 `.credentials.yaml` 里，只是索引建不出来）。
+    //    这正是那张表存在的理由，也是「守卫比人眼可靠」的又一例。
+    ['DOUBAO', 'doubao'],
 ];
 /**
  * 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{SUFFIX}`（前缀由单一真相源派生）。
@@ -1283,6 +1417,7 @@ class FileStore {
                 loomyPermanentLocked: value.loomyPermanentLocked === true,
                 // 老文档没这个键 → 启用，与升级前行为一致。
                 gatewayEnabled: sanitizeGatewayEnabled(value.gatewayEnabled),
+                qoderTrafficGuard: sanitizeQoderTrafficGuard(value.qoderTrafficGuard),
                 // 老文档没这个键 → 关闭（安全默认，与读站点 A 同判据）。
                 gatewayAllowLan: sanitizeGatewayAllowLan(value.gatewayAllowLan),
                 // 老文档没这个键 → 启用，与升级前行为一致。
@@ -1291,6 +1426,7 @@ class FileStore {
                 sessionBalanceEnabled: sanitizeSessionBalanceEnabled(value.sessionBalanceEnabled),
                 // 老文档没这个键 → 空表（= 全部走余额分档，与升级前行为一致）。
                 strictManualOrder: sanitizeStrictManualOrder(value.strictManualOrder),
+                preferredRotation: sanitizePreferredRotation(value.preferredRotation),
                 // 老文档没新键 → 按老布尔迁移（与 `SettingsStore` 同一判据）；两者都没有 → 仅侧栏。
                 panelEntry: sanitizePanelEntry(value.panelEntry, value.sidebarEntryEnabled),
                 // 老文档没这个键 → 空数组（未自定义），展示侧按声明顺序渲染。
@@ -1392,6 +1528,7 @@ class FileStore {
                 sessionBalanceEnabled: true,
                 // 同上：恢复出的文档不含严格手动顺序信息 → 空表（与全新安装一致）。
                 strictManualOrder: {},
+                preferredRotation: {},
                 // 同上：恢复出的文档不含面板入口信息 → 默认「仅侧栏」（与全新安装一致）。
                 panelEntry: DEFAULT_PANEL_ENTRY,
                 // 凭据文件里也没有顺序信息 → 空数组（未自定义，与全新安装一致）。

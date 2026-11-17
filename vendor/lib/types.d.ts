@@ -274,6 +274,11 @@ export interface ProviderAccountStatus extends ProviderAccountEntry {
      */
     modelscopeKeyMask?: string;
     /**
+     * Qoder 账号是否已保存网页会话 Cookie（用于读资源包逐笔到期）。
+     * 只下发布尔值，Cookie 本身绝不下发。
+     */
+    qoderWebSession?: boolean;
+    /**
      * 七牛云 API Key 的**打码串**（宿主侧 `maskQiniuKey` 生成，形如 `sk-a…wxyz`）。
      *
      * ⚠️ 只下发打码串，**绝不下发明文**（凭据经 RPC 明文下发等于把它摊到客户端的
@@ -580,6 +585,26 @@ export interface RpcPollLoginRequest {
     provider: string;
 }
 /**
+ * RPC: 手动提交回调链接（codearts 华为云 / trae 字节跳动）。
+ *
+ * 用途：授权回调被定向到**宿主本机**的 `127.0.0.1:<port>`，用户在手机 /
+ * 另一台电脑上完成登录时那一跳打不开，但地址栏里留下一条合法的回调链接。
+ * 把它交回来即可在本机完成原来只有浏览器能完成的那一步。
+ *
+ * 两家机制不同（codearts 回传 code 需交换、trae 直传 token），但「人工搬运
+ * 回调链接」是同一语义 ⇒ 共用本端点；由登记时的 provider 决定转调哪个提交入口。
+ */
+export interface RpcSubmitCallbackRequest {
+    /** `account.create` 返回的占位账号 id（本进程内存里的那一轮登录）。 */
+    accountId: string;
+    /**
+     * 用户粘贴的整条回调链接。
+     * - codearts：`http://127.0.0.1:<port>/oauth/callback?code=…`（或旧流程 `secret=`）；
+     * - trae：`http://127.0.0.1:<port>/authorize?refreshToken=…&userInfo=…&userJwt=…`。
+     */
+    callbackUrl: string;
+}
+/**
  * RPC: 轮询登录进度（`login.poll`）。
  *
  * ## 三态 —— ⚠️ 必须按 `done` **与** `success` 两个字段判
@@ -602,6 +627,68 @@ export interface RpcPollLoginResponse {
     done: boolean;
     success?: boolean;
     error?: string;
+}
+/**
+ * RPC: 手动提交 OAuth 回调地址（`login.submitCallback`）。
+ *
+ * ## 为什么需要它
+ *
+ * 回调式 provider 的 OAuth 都把浏览器重定向到
+ * `http://127.0.0.1:<port>/<各自的回调路径>`。这个地址**只在运行 DSH 的那台
+ * 机器上有效**。
+ *
+ * ⚠️ **各家路径互不相同**（PR #8 审计 P2-1 实测，别照抄任何一家）：
+ * codearts `/oauth/callback`（`src/oauth.ts` 的 `REDIRECT_PATH`，**只有它用这个
+ * 常量**）、gemini `/oauth-callback`（且 host 是 `localhost`）、lobsterai 与
+ * accio `/auth/callback`、autoclaw 国际版 `/auth/callback-zai`、trae `/authorize`。
+ *
+ * 用户通过外网（反向代理 / 端口转发 / 远程桌面）访问 DSH 时，浏览器跑在
+ * **用户本地**，`127.0.0.1` 指向用户自己的电脑 ⇒ 回调打到一台没有监听端口的
+ * 机器上，浏览器报「拒绝连接」，宿主永远收不到 `code` ⇒ 前端只能干等到
+ * 5 分钟上限后报「登录超时」。**这是网络拓扑问题，不是任何一个 provider 的
+ * 协议缺陷。**
+ *
+ * ## 修法
+ *
+ * 用户把浏览器地址栏里那条回调 URL **原样复制回来**，由**宿主代替用户**去访问
+ * 它 —— 宿主就在那台机器上，回调服务器正在 `127.0.0.1:<port>` 上监听。
+ * 于是各 provider 的 `createServer` 处理器**一行都不用改**，它们本来就在等这个
+ * 请求；`code` / `secret` / `fingerprint` / `token` 四种回调形态（见
+ * `src/login.ts` 的 `startCallbackServer` 与 `startOAuthCallbackServer`）全部
+ * 自动支持，换 token / 写凭据 / `login.poll` 报 `done` 的既有链路原样复用。
+ *
+ * ## ⚠️ 为什么**不**复用 `RpcSubmitCallbackRequest`
+ *
+ * 那个类型是 `account.submitCallback` 的入参（`{ accountId, callbackUrl }`），
+ * 它要求账号已经在宿主侧登记了专用解析器。本端点**不需要 accountId** ——
+ * 它只把 URL 交给宿主盲发一次 GET，由各 provider 自己的回调服务器处理。
+ * 同名声明会被 TypeScript 接口合并成一个「三个字段全必填」的类型 ——
+ * **危害在编译期**（PR #8 审计 P3 修正：运行时本就不校验、`payload as T` 照旧，
+ * 所以不会「互相污染」；真实后果是**合并后错通道的载荷看起来合法**：
+ * 只传 `{ url }` 的调用点不再报 TS2345，一路编译通过、运行时在
+ * `pendingManualCallbacks.get(undefined)` 处静默查不到）⇒ 必须换名。
+ */
+export interface RpcLoginSubmitCallbackRequest {
+    /** 浏览器地址栏里那条完整回调 URL（含 `code` / `state` 等查询参数）。 */
+    url: string;
+}
+/**
+ * RPC: 手动提交回调地址的响应。
+ *
+ * ⚠️ `status` 只是**回调服务器回给宿主的 HTTP 状态码**，不代表登录已成功：
+ * 真正的成功判据仍是 `login.poll` 报 `{done:true, success:true}`
+ * （回调处理器内部还要拿 `code` 去换 token，那是异步的）。
+ *
+ * 只有**成功**（2xx / 3xx）才会走到这里。各 provider 的典型取值：
+ * `200`（回调处理器已受理，`code` 换 token 在后台继续）/ `204`（OPTIONS 预检）/
+ * `307`（`secret` 分支换成功后跳 portal 结果页）。
+ *
+ * ⚠️ **`400` / `5xx` 不再是成功路径的值**（PR #8 对抗审计 P2-1）：`400` 是
+ * `state` 不匹配（过期地址）、`5xx` 是换凭据失败，两者都必须返回
+ * `ok:false` —— 否则客户端拿不到失败信号、按钮永久停在「提交中…」。
+ */
+export interface RpcLoginSubmitCallbackResponse {
+    status: number;
 }
 export interface RpcUpdateAccountRequest {
     accountId: string;
@@ -1368,6 +1455,24 @@ export interface RpcModelListEntry {
      * 恢复路径。这是「误判代价不对称」的必然要求：能藏，但必须能找回。
      */
     dead: boolean;
+    /**
+     * `true` = 该模型**只由 benefit（免费额度）通道提供**（Gitee issue IKJOF7）。
+     *
+     * ⚠️ **缺失 = 不该下这个判断**，既不是 `false` 也不是「确认不需要福利包」：
+     * 判据是远端 `opengw gateway/config` 的 benefit 集合，而冷缓存 / 远端降级时
+     * 那份集合是「**未确认**」。把「未确认」渲染成任何一种标记都会在冷启动那一帧
+     * 给每条模型挂错提示（与 `dead-model-store.ts` 的「拿读不到反推已下架」同型）。
+     *
+     * ⚠️ 只有 `codearts` 会写这个字段（benefit 是它独占的概念），其余供应商恒缺失。
+     *
+     * ## 为什么值得占一个字段
+     *
+     * 这类模型不带 `maas_type: benefit` 头会回 `002002009.404 The model is not
+     * registered`，而纯积分制账号没有福利包 ⇒ 最终错误与「模型名写错」**同形**，
+     * 用户看不出真正原因是「要走福利通道」。设置页标一句「需福利包」就把这条
+     * 因果讲清楚了。
+     */
+    benefitOnly?: boolean;
 }
 /** RPC: 列出某 provider 的模型响应 */
 export interface RpcModelListResponse {
@@ -1655,11 +1760,11 @@ export interface RpcModelSetDisabledManyRequest {
     modelIds: string[];
     disabled: boolean;
     /**
-     * 关闭方向是否同时落「供应商关闭」意图。默认 `true`。
+     * 与 {@link RpcModelSetAllDisabledRequest.closeProvider} 同一条契约：
+     * 缺省即 `true`；表达「只关模型、不动供应商关闭意图」传 `false`（内部走 `'keep'`）。
      *
-     * ⚠️ 与 {@link RpcModelSetAllDisabledRequest.closeProvider} 同一条契约 ——
-     * 两个入口写的是同一张黑名单，不给这条就会出现「同一份黑名单状态经两个入口
-     * 得到不同意图」，随后打开任意模型时又被清掉，状态反向跳变。
+     * ⚠️ 不能直接传布尔表达「不动意图」——`writeModelsWithProviderClosed(..., false)`
+     * 的语义是 `delete providerClosed[provider]`，会主动删掉用户设好的「关闭供应商」。
      */
     closeProvider?: boolean;
 }
@@ -1895,6 +2000,17 @@ export interface RpcGatewayStatusResponse {
      * - `factory-missing`：插件装配异常，压根没有可用的网关实例工厂
      */
     lastError: RpcGatewayLastError | null;
+    /**
+     * 对外地址（env `DSH_OPENAI_GATEWAY_PUBLIC_URL` 的解析结果），非法值降级为 `null`。
+     *
+     * ⚠️ **必填**（不是 `?`）：三个网关 RPC（`gateway.getEnabled` /
+     * `gateway.setEnabled` / `gateway.setAllowLan`）都必须回传它 —— 客户端
+     * `setGatewayStatus(res)` 拿到响应就整份覆盖本地状态（`plugin-src/client/jet-hub.js`
+     * 三处），漏一处 ⇒ 用户拨一下开关，面板就把该字段冲成 `undefined`，地址退回
+     * `0.0.0.0` 并重新弹出「把 0.0.0.0 换成本机局域网 IP」的提示（PR #54 审计 P1）。
+     * 写成必填，新增构造点漏字段时由 `tsc` 拦下，不再靠人记。
+     */
+    publicUrl: string | null;
 }
 /** 网关「期望运行但未监听」的结构化原因（见 {@link RpcGatewayStatusResponse.lastError}）。 */
 export interface RpcGatewayLastError {
@@ -1976,6 +2092,28 @@ export interface RpcGatewaySetEnabledRequest {
 /** RPC: 「允许局域网访问」开关写入请求（响应 = 整份 {@link RpcGatewayStatusResponse}）。 */
 export interface RpcGatewaySetAllowLanRequest {
     allowLan: boolean;
+}
+/**
+ * RPC: 「默认取最强思考档」开关的读取响应（2026-11-11）。
+ *
+ * 开 = 在模型选择器里选完模型后，思考强度自动落在该模型支持的最高档；
+ * 关 = 逐字节回到改动前的行为（各家适配器自己声明的 `defaultEffort`）。
+ */
+export interface RpcReasoningDefaultGetEnabledResponse {
+    enabled: boolean;
+}
+/** RPC: 「默认取最强思考档」开关写入请求。 */
+export interface RpcReasoningDefaultSetEnabledRequest {
+    enabled: boolean;
+}
+/**
+ * RPC: 「默认取最强思考档」开关写入响应。
+ *
+ * ⚠️ 回传的是**落盘后重读的值**，不是请求里的值 —— 与 `gateway.setEnabled`
+ * 同取向：客户端一律以后端回传为准，不做乐观更新。
+ */
+export interface RpcReasoningDefaultSetEnabledResponse {
+    enabled: boolean;
 }
 /** RPC: 「渠道原生搜索」开关的读取响应。 */
 export interface RpcNativeSearchGetEnabledResponse {
@@ -2147,6 +2285,14 @@ export interface LoginFlowOptions {
     maxAttempts?: number;
     /** 登录流程选择：'oauth'（默认）或 'ticket'（旧流程回退）。 */
     flow?: 'oauth' | 'ticket';
+    /**
+     * 回调等待预算（毫秒）；默认 180 秒。
+     *
+     * ⚠️ 只为**可测**而存在：超时后必须把收码器标记为已结算，否则用户粘回来的
+     * 链接会被接受并回「成功」（PR #57 正向审计 P3-8）。没有这个入口就只能
+     * 真等 180 秒，超时分支的守卫等于没有。
+     */
+    callbackTimeoutMs?: number;
 }
 /**
  * buddy (腾讯 CodeBuddy) 凭据，存储在 BUDDY_ACCESS_TOKEN 下。

@@ -29,6 +29,7 @@
 import { LlmAdapter, LlmError, } from '@deepseek-ai/dsh-llm';
 import { createModelCatalog } from './model-catalog.js';
 import { collectImages, consumeOpenAiSse, serializeMessages } from './openai-compat.js';
+import { rewriteTencentContentFingerprints } from './openai-gateway/tencent-fingerprint.js';
 import { isAbortLike } from './aggregate-adapter.js';
 import { registerAdapterIdempotent } from './llm-register-compat.js';
 import { nextUtc8DayStartMs } from './model-queue.js';
@@ -53,6 +54,39 @@ export function marvisRetryAfterMs(kind, retryAfterMs, attempt, nowMs = Date.now
     }
     const backoff = 60_000 * 2 ** Math.max(0, attempt - 1);
     return Math.min(backoff, 30 * 60_000);
+}
+/**
+ * `messages[]` 里那条 `role:'system'` 的腾讯系内容级风控指纹改写。
+ *
+ * ⚠️ **位置判据**（2026-11-15 真机实测，同型报障见 Gitee issue IKVF8Z）：
+ * 同一份身份句
+ * - 只出现在**顶层 `system`** ⇒ 200（那份此前已由本文件的
+ *   `rewriteTencentContentFingerprints` 改写）；
+ * - 出现在 **`messages[]` 的 system 消息**里 ⇒ 403
+ *   `{"code":4100406,"msg":"非法请求"}`，把该句清洗掉即恢复 200
+ *   ⇒ 判定发生在 messages 这条，**不在**顶层。
+ *
+ * ⇒ 与 `buddy-adapter.ts` 的 `wire.push({ role:'system', content: rewrite(…) })`
+ * 同口径：两个位置都要改，只改一处等于没改。
+ *
+ * ⚠️ 兜底替换只作用于 **system 消息**：assistant 正文实测不拦，改它既换不来放行、
+ * 又破坏历史回读证据（同 buddy 那条注释）。
+ */
+function rewriteMarvisSystemText(text, provider) {
+    // 先过登记表（IKJNA1 同一份表），再兜底清掉表未覆盖的形态（中文句式、上游措辞漂移）。
+    // ⚠️ **两处 system 位置必须走同一个函数**：登记表只覆盖英文句式，中文身份句
+    //    （`你是一个由 DeepSeek Harness 驱动的 AI 智能体。`）过登记表**原样返回**，
+    //    完全靠下面这条兜底正则 —— 一份实现两处共用，才不会出现「messages 清了、顶层没清」。
+    // `DSH` 是 2026-11-15 对 marvis 网关实测放行的替换值（清洗后中英文均 200）。
+    return rewriteTencentContentFingerprints(text, provider)
+        .replace(/DeepSeek\s+Harness/gi, 'DSH');
+}
+function rewriteMarvisSystemMessage(message, provider) {
+    const { role, content } = message;
+    if (role !== 'system' || typeof content !== 'string')
+        return message;
+    const rewritten = rewriteMarvisSystemText(content, provider);
+    return rewritten === content ? message : { ...message, content: rewritten };
 }
 /** Marvis 适配器。 */
 export class MarvisAdapter extends LlmAdapter {
@@ -150,7 +184,7 @@ export class MarvisAdapter extends LlmAdapter {
         const id = normalizeMarvisModelId(model);
         const entry = MARVIS_FALLBACK_MODELS.find((m) => m.id === id);
         if (entry?.supportsImage !== true) {
-            throw new LlmError(`marvis: 模型 "${model}" 不支持图片输入（本家只有 main-auto 收图）`, 'UNSUPPORTED_CONTENT');
+            throw new LlmError(`marvis: 模型 "${model}" 不支持图片输入`, 'UNSUPPORTED_CONTENT');
         }
         if (this.options.readImage === undefined) {
             throw new LlmError('marvis: 图片输入需要附件服务', 'UNSUPPORTED_CONTENT');
@@ -251,11 +285,24 @@ export class MarvisAdapter extends LlmAdapter {
     /** 指定槽发一次请求（轮换循环的复用单元）。 */
     async *streamVia(slot, options) {
         const imageUrls = await this.resolveImageUrls(options.model, options.messages);
-        const messages = serializeMessages(options.messages, imageUrls);
+        // ⚠️ `messages[]` 里的 system 那条**也要**过腾讯系内容级风控指纹改写
+        //    （位置判据见 `rewriteMarvisSystemMessage`）：此前只改顶层 `system`，
+        //    身份句仍随 messages 出站 ⇒ 403 `4100406 非法请求`（2026-11-15 实测）。
+        const messages = serializeMessages(options.messages, imageUrls).map((message) => rewriteMarvisSystemMessage(message, this.product.id));
         const payload = buildMarvisPayload({
             model: normalizeMarvisModelId(options.model),
             messages,
-            ...options.system !== undefined && options.system.length > 0 ? { system: options.system } : {},
+            // ⚠️ `system` 要过腾讯系内容级风控指纹改写（IKJNA1 同一份表、同一判据）。
+            //    2026-11-15 真机实测 marvis **当前不拦**这些指纹（13 档全 200），
+            //    这里登记是**预防性**的：marvis 属腾讯域，与 buddy/workbuddy 同一套风控，
+            //    服务端随时可能下发新指纹。代价是 DSH 自己的身份句会被改写，故**只改 system**
+            //    （assistant 正文实测不拦 —— 改它既换不来放行，又破坏历史回读证据）。
+            // ⚠️ 顶层 `system` 与 `messages[]` 的 system **走同一个函数**
+            //    （正向审计 P2-1：此前这里只过登记表、没有兜底正则 ⇒ 中文身份句在顶层
+            //    不会被清洗，与「两个位置都要改」自相矛盾）。
+            ...options.system !== undefined && options.system.length > 0
+                ? { system: rewriteMarvisSystemText(options.system, this.product.id) }
+                : {},
             ...options.tools !== undefined ? { tools: options.tools } : {},
             ...options.temperature !== undefined ? { temperature: options.temperature } : {},
             ...options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {},

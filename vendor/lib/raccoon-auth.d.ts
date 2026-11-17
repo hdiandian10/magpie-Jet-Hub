@@ -172,6 +172,13 @@ export declare class RaccoonAuth extends Service {
     fetchCreditBalance(credential: RaccoonCredential): Promise<CreditBalance | null>;
     /** 领取一次性登录奖励。 */
     claimLoginReward(credential: RaccoonCredential): Promise<ClaimOutcome>;
+    /**
+     * 每日签到（办公端 `setting_info` 结算触发器 + 余额差核对）。
+     *
+     * ⚠️ 走实例方法而不是让 `provider-credits` 直接调自由函数：这样注入的
+     * `fetchImpl`（测试替身 / 代理）不会被绕过，与余额查询同一条口径。
+     */
+    claimDailyCheckin(credential: RaccoonCredential): Promise<ClaimOutcome>;
     /** 查询一次性登录奖励是否已领。 */
     fetchOnboardingStatus(credential: RaccoonCredential): Promise<{
         claimed: boolean;

@@ -35,6 +35,7 @@
 import type { Context } from '@deepseek-ai/cordis';
 import Schema from '@deepseek-ai/schemastery';
 import type { ProviderAccountEntry } from './types.js';
+import type { QoderTrafficProvider } from './qoder-traffic-guard.js';
 /** Jet Hub schema namespace（老契约的 settings 命名空间名）。 */
 export declare const JET_HUB_NS = "jet-hub";
 /**
@@ -108,6 +109,92 @@ export type PermanentLockMap = Record<string, boolean>;
  * 天然就是「一个都没开」。
  */
 export type StrictManualOrderMap = Record<string, boolean>;
+/**
+ * 「轮换起点」的会话级偏好：provider → (sessionId → 账号 id)。
+ *
+ * ## ⚠️ 为什么是两层稀疏表（provider 再 session）
+ *
+ * - **按 provider**：各家账号池互不相通，同一会话在 workbuddy 与 codearts 下各选一个；
+ * - **按 session**：这正是「当前会话」语义 —— 换会话回到默认，否则「起点」会变成事实上的全局固定。
+ *
+ * ## ⚠️ 为什么存 `accountId` 而不是「第 N 个」
+ *
+ * 用户视觉上是「账号 N」，但**位次会随拖拽/增删变化**。存位次会让用户
+ * 拖一下顺序就静默改掉起点。位次只在渲染时现算（见 RPC `account.getPreferred`）。
+ *
+ * ## ⚠️ 为什么**必须**记 `at`
+ *
+ * 最初设计刻意不记时间戳，理由是「本表只由用户显式写入，不会快速增长」。
+ * **那个判断是错的**：键是 `sessionId`，而用户**每开一个新会话**就可能选一次起点
+ * ⇒ 表随会话数**单调增长且永不回收**（`state.json` 会被无限撑大，
+ * 而它是**整体读入内存**的）。
+ *
+ * ⇒ 现在记 `at`（写入时刻 ms）并**按 provider 淘汰最旧的会话**
+ *（上限 {@link PREFERRED_ROTATION_MAX_SESSIONS}）。
+ *
+ * ⚠️ 淘汰是**有损**的（最旧的会话会丢失起点，回落「默认」）。这是刻意的取舍：
+ * 宁可让早已删掉的旧会话丢失设置，也不能让 `state.json` 无限增长。
+ */
+/**
+ * 「轮换起点」条目。
+ *
+ * ## ⚠️ 两种形态并存（新格式 + 旧格式兼容）
+ *
+ * | 形态 | 何时写的 | 语义 |
+ * |---|---|---|
+ * | `{ position, at }` | **本版起** | 「用**默认顺序**的第 N 位」—— 拖拽后跟着位次走 |
+ * | `{ accountId, at }` | 早期版本 | 「用**这个账号**」—— 拖拽后仍指向原号 |
+ *
+ * ## 为什么改成存位次（用户 2026-11-10 明确要求）
+ *
+ * 用户的原话：「当前会话选择帐号1，如果我去帐号管理界面手动排序了，
+ * 回来当前会话应该**仍选帐号1**（即新的第 1 位），而不是跟随原来那个号」。
+ *
+ * ⚠️ 副作用（已确认接受）：在首位之前插入/删除账号会让位次指向别的号。
+ *
+ * ## ⚠️ 为什么保留 `accountId` 形态
+ *
+ * 升级用户的 `state.json` 里是旧格式。若直接丢弃 ⇒ **静默丢用户数据**
+ *（本仓反复记录过）。⇒ 旧格式继续可读，只是不再写入。
+ * 换算成位次需要账号池，而 `sanitizePreferredRotation` 是**纯函数**看不到池
+ * ⇒ 换算在 `AccountPool.preferredRotationFor` 里做（见那里的注释）。
+ */
+export type PreferredRotationEntry = {
+    position: number;
+    at: number;
+} | {
+    accountId: string;
+    at: number;
+}
+/**
+ * ⚠️ **最老格式**（本功能最早那版，无 `at`）。
+ *
+ * `sanitizePreferredRotation` **原样保留**它（不转换）—— 因为 historically
+ * 它是直接当 accountId 用的。故消费方（`AccountPool.preferredRotationFor`）
+ * 必须自己判 `typeof entry === 'string'`。
+ *
+ * ⚠️ 若在类型里漏掉这一支，in 运算符会在运行时抛 `TypeError`（真实缺陷）。
+ */
+ | string;
+export type PreferredRotationMap = Record<string, Record<string, PreferredRotationEntry>>;
+/**
+ * 每个 provider 最多保留多少个**会话**的轮换起点（超出时淘汰 `at` 最小的）。
+ *
+ * 取 64：正常用户同时活跃的会话是个位数；64 足以覆盖「忘了关的旧会话」，
+ * 而单条 ≈ 100 字节 ⇒ 单 provider 至多 ≈ 6 KB。
+ */
+export declare const PREFERRED_ROTATION_MAX_SESSIONS = 64;
+/**
+ * 归一化「轮换起点」表（{@link JetHubState.preferredRotation}）。
+ *
+ * 判据：非对象/数组 ⇒ 空表；provider 或 sessionId 为空串 ⇒ 丢弃；
+ * 值必须是非空字符串；**清完后为空的层一并丢弃**（不留空对象）。
+ *
+ * ⚠️ **读写两侧都要调用**（与本仓 `sanitizeStrictManualOrder` 同款）：
+ * 老契约后端不经过 schema，只靠这个函数。
+ */
+export declare function sanitizePreferredRotation(raw: unknown): PreferredRotationMap;
+export declare function prunePreferredRotation(sessions: Record<string, PreferredRotationEntry>, limit?: number): Record<string, PreferredRotationEntry>;
 /**
  * Jet Hub 的**唯一**入口位置。
  *
@@ -184,6 +271,7 @@ export interface JetHubState {
      * 缺键语义为**启用**：老用户升级后行为与升级前完全一致。
      */
     gatewayEnabled?: boolean;
+    qoderTrafficGuard?: Partial<Record<QoderTrafficProvider, boolean>>;
     /**
      * 「允许局域网访问」开关（2026-10-20）：`true` = 网关绑 `0.0.0.0`（全部网卡，
      * 局域网可达）；`false`/缺键 = 只绑回环或 env 配置的本机地址。
@@ -224,6 +312,22 @@ export interface JetHubState {
      * —— 没有任何不可逆后果。缺键语义为**启用**（2026-10-30 用户要求的默认）。
      */
     sessionBalanceEnabled?: boolean;
+    /**
+     * 「轮换起点」：某 provider 在某**会话**下指定的起始账号。
+     *
+     * 语义：**只把选号轮换的起点挪到该账号**，不改任何选号策略 ——
+     * 档位判据、可用性过滤、失败换号全部照旧。
+     *
+     * ```
+     * 策略顺序：A → B → C → D → A（循环）
+     * 选 C 后： C → D → A → B → C
+     * ```
+     *
+     * ⚠️ 与「优先级」的区别：不是「先烧这个号」，而是「从它开始数」。
+     * ⚠️ 缺键 = 默认起点（与升级前**逐字节一致**）。
+     * ⚠️ 存 `accountId` 而非位次：位次会随拖拽/增删变化。
+     */
+    preferredRotation?: PreferredRotationMap;
     /**
      * 「严格手动顺序」开关表（{@link StrictManualOrderMap}）：
      * provider id → 是否**完全**按用户拖拽的顺序取号。
@@ -409,10 +513,12 @@ export declare const jetHubSchema: Schema<Schemastery.ObjectS<NoInfer<{
     disabledModels: Schema<import("@deepseek-ai/cosmokit").Dict<any, string>, import("@deepseek-ai/cosmokit").Dict<any, string>, "defined">;
     loomyPermanentLocked: Schema<boolean, boolean, "defined">;
     gatewayEnabled: Schema<boolean, boolean, "defined">;
+    qoderTrafficGuard: Schema<import("@deepseek-ai/cosmokit").Dict<any, string>, import("@deepseek-ai/cosmokit").Dict<any, string>, "defined">;
     gatewayAllowLan: Schema<boolean, boolean, "defined">;
     nativeWebSearchEnabled: Schema<boolean, boolean, "defined">;
     sessionBalanceEnabled: Schema<boolean, boolean, "defined">;
     strictManualOrder: Schema<import("@deepseek-ai/cosmokit").Dict<any, string>, import("@deepseek-ai/cosmokit").Dict<any, string>, "defined">;
+    preferredRotation: Schema<import("@deepseek-ai/cosmokit").Dict<any, string>, import("@deepseek-ai/cosmokit").Dict<any, string>, "defined">;
     panelEntry: Schema<string, string, "plain">;
     providerOrder: Schema<string[], string[], "defined">;
     minimaxXff: Schema<string, string, "defined">;
@@ -422,10 +528,12 @@ export declare const jetHubSchema: Schema<Schemastery.ObjectS<NoInfer<{
     disabledModels: Schema<import("@deepseek-ai/cosmokit").Dict<any, string>, import("@deepseek-ai/cosmokit").Dict<any, string>, "defined">;
     loomyPermanentLocked: Schema<boolean, boolean, "defined">;
     gatewayEnabled: Schema<boolean, boolean, "defined">;
+    qoderTrafficGuard: Schema<import("@deepseek-ai/cosmokit").Dict<any, string>, import("@deepseek-ai/cosmokit").Dict<any, string>, "defined">;
     gatewayAllowLan: Schema<boolean, boolean, "defined">;
     nativeWebSearchEnabled: Schema<boolean, boolean, "defined">;
     sessionBalanceEnabled: Schema<boolean, boolean, "defined">;
     strictManualOrder: Schema<import("@deepseek-ai/cosmokit").Dict<any, string>, import("@deepseek-ai/cosmokit").Dict<any, string>, "defined">;
+    preferredRotation: Schema<import("@deepseek-ai/cosmokit").Dict<any, string>, import("@deepseek-ai/cosmokit").Dict<any, string>, "defined">;
     panelEntry: Schema<string, string, "plain">;
     providerOrder: Schema<string[], string[], "defined">;
     minimaxXff: Schema<string, string, "defined">;
@@ -442,6 +550,7 @@ export declare const jetHubSchema: Schema<Schemastery.ObjectS<NoInfer<{
  * 任何一次读取失败都变成「网关被静默关闭」，而用户根本不知道自己关过它。
  */
 export declare function sanitizeGatewayEnabled(raw: unknown): boolean;
+export declare function sanitizeQoderTrafficGuard(raw: unknown): NonNullable<JetHubState['qoderTrafficGuard']>;
 /**
  * 归一化「允许局域网访问」开关。
  *

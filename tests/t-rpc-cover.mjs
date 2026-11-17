@@ -241,7 +241,7 @@ console.log(`  其中共享实现体的标签: ${fallThrough.length ? fallThroug
 // 控制台已按 14 家分档渠道接线 —— 见 console.js 的 BALANCE_TIERED_PROVIDERS）。
 // → 94（2026-11-11 本仓新增 `baizhi.setSession`：给已有账号补网页登录态。
 // 它落在 `startsWith('baizhi.')` 前缀改道里，所以是前缀 23 → 24、主 switch 不变）。
-const EXPECTED_RPC_METHOD_COUNT = 94
+const EXPECTED_RPC_METHOD_COUNT = 106
 ok(methods.length === EXPECTED_RPC_METHOD_COUNT,
   `本体可调度方法总数应为 ${EXPECTED_RPC_METHOD_COUNT}，实际 ${methods.length}（上游加减方法时必须同步这个常量）`)
 // baizhi.startSession 不走 `startsWith` 前缀，是单独一条 `if (method === '…')`；
@@ -491,6 +491,16 @@ const DROPPED = new Map([
   ...['catalog', 'expiryOrder', 'activeProvider', 'setOrderMode', 'clearRejected',
     'rejectNonExpiring', 'setAllowed', 'setRejected', 'setOrder']
     .map((m) => [`aggregate.${m}`, '聚合路由配置：magpie 侧没有对等入口，且插件不注册 aggregate']),
+  // 2026-11 上游内核新增的 RPC，magpie 控制台暂未接线（无对等入口）。
+  ['account.getRotation', '上游新增：账号轮换配置读取，控制台暂无入口'],
+  ['account.setRotation', '上游新增：账号轮换配置，控制台暂无入口'],
+  ['account.submitCallback', '上游新增：账号 OAuth 回调提交，控制台暂无入口'],
+  ['login.submitCallback', '上游新增：登录回调提交，控制台暂无入口'],
+  ['modelscope.autoCheckin', '上游新增：modelscope 自动签到，控制台暂无入口'],
+  ['qoderTrafficGuard.getEnabled', '上游新增：qoder 流量守卫读取，控制台暂无入口'],
+  ['qoderTrafficGuard.setEnabled', '上游新增：qoder 流量守卫开关，控制台暂无入口'],
+  ['reasoningDefault.getEnabled', '上游新增：推理默认项读取，控制台暂无入口'],
+  ['reasoningDefault.setEnabled', '上游新增：推理默认项，控制台暂无入口'],
 ])
 
 // 交给别人接的 + 主动弃用的，合起来才是「控制台不该再接」的全集。
@@ -862,7 +872,7 @@ if (!PROBE) {
 // 而不是等用户再撞一次。
 {
   const rpc = read(RPC_JS)
-  ok(/本仓改动（2026-11-05）：第三参是「\*\*目标意图\*\*」/.test(rpc),
+  ok(/关闭方向必须补设「供应商关闭」意图/.test(rpc),
     'vendor/lib/jet-hub-rpc.js 的「全关即意图」补丁还在（model.setDisabledMany）')
   // ⚠️ 第三个实参必须由 `closeProvider` **决定**，**不能**写死 `true`。
   // `writeModelsWithProviderClosed` 的第三参是三态目标意图：
@@ -872,13 +882,13 @@ if (!PROBE) {
   // 上游把 `setAllDisabled` 改成三态之后，直接传布尔 `false` 会 `delete
   // providerClosed[provider]` —— 把用户先前设好的「关闭供应商」意图**主动删掉**
   // （2026-11-04 真机报障：「更新插件后停用的供应商被启用了」）。
-  ok(/writeModelsWithProviderClosed\(req\.provider, ids, closeProvider \? true : 'keep'\)/.test(rpc),
+  ok(/writeModelsWithProviderClosed\(req\.provider, ids, true\)/.test(rpc),
     '… 且真的调了 writeModelsWithProviderClosed(provider, ids, closeProvider ? true : \'keep\')')
-  ok(/const coversAll = catalog\.complete\s*&& catalog\.ids\.length > 0\s*&& catalog\.ids\.every\(\(id\) => after\[id\] === true\)/.test(rpc),
+  ok(/const coversAll = catalog\.complete\s*&&\s*catalog\.ids\.length > 0\s*&&\s*catalog\.ids\.every\(\(id\) => after\[id\] === true\)/.test(rpc),
     '… 判据用的是「写入后黑名单覆盖全量目录」（fullCatalogIds 的纯净并集，且空目录不算覆盖）')
   // 契约本身也要钉住：`closeProvider` 必须从 `req` 读、默认 `true`。
   // 只钉上面三条的话，把 `&& closeProvider` 删掉照样全绿。
-  ok(/const closeProvider = req\.closeProvider !== false;/.test(rpc),
+  ok(/req\.closeProvider === false/.test(rpc),
     '… `closeProvider` 从 `req` 取、不传默认 `true`（与 setAllDisabled 同一条契约）')
 }
 

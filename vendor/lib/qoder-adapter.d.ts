@@ -227,6 +227,49 @@ export declare const PROVIDER = "qoder";
  */
 export declare function qoderEffortsFor(model: QoderFallbackModel): string[];
 /**
+ * 排队等待策略（`DSH_QODER_QUEUE_WAIT_MODE`）。
+ *
+ * 为什么需要这个开关（真实故障，2026-11-10）：Qoder 高峰期会把请求放进**模型级
+ * 队列**（业务码 `10605`）。默认的 `wait` 档在网关内部静默等待，**期间一个字节
+ * 都不发给客户端**，而上限是 30 分钟 —— 于是调用方（OpenViking / 各类 OpenAI
+ * SDK）总是先被自己的超时（100~120 秒）掐断，表现为「连接建立了、什么都不回、
+ * 最后超时」，与「死机」无法区分。同类项目（qoder2api-hub / qoder2api /
+ * 9router-qoder-plus）都因此引入了「可见 / 快速失败」两档。
+ *
+ * - `wait`（**默认**，保持既有行为）：内部等待后重试，期间不产出任何帧。
+ * - `visible`：等待**分片进行**，每片产出一帧空 `text-delta` 心跳。空串不会
+ *   改动正文（`content += ''`），只让 SSE 通道持续有字节 —— 客户端与中间层
+ *   因此不会把「排队中」误判成卡死。
+ * - `fast`：**不等待**，立刻抛 `QUEUE` 错误，把「等还是换模型」的决定交还给
+ *   调用方（OpenViking 等多凭据客户端会据此切到备用模型，而不是干等）。
+ *
+ * ⚠️ 排队**不是**账号故障：三档都**不换号、不刷新凭据、不写冷却**
+ *（与 qoder2api-hub 的 `ShouldFailover=false` 同判据 —— 队列是模型级的，
+ * 换号对同一模型无效，还会把多个号一起打进冷却）。
+ */
+export type QoderQueueWaitMode = 'wait' | 'visible' | 'fast';
+export declare function resolveQueueWaitMode(): QoderQueueWaitMode;
+/**
+ * 本次排队**实际生效**的策略：聚合派发内一律 `fast`，否则按环境变量。
+ *
+ * ## 为什么聚合调用要无视 `DSH_QODER_QUEUE_WAIT_MODE`（真实故障，2026-11-14）
+ *
+ * 聚合（`aggregate/*`）只在候选**报错**时切换下一个候选：
+ * - `wait` 档静默等待（上限 30 分钟）⇒ 聚合永远等不到错误，请求被锁死在 qoder 上；
+ * - `visible` 档先吐空 `text-delta` 心跳 ⇒ 被聚合的 `isVisibleContent` 判成
+ *   「已产出内容」⇒ **禁止切换**（防两段回答拼接），同样锁死。
+ *
+ * 只有 `fast`（立刻抛 `QUEUE`）能让聚合换到下一个能用的候选。直连 qoder 时没有
+ * 「下一个候选」可换，仍按环境变量等待 / 向下游报排队，行为不变。
+ *
+ * ⚠️ 判据来自 `aggregate-dispatch-context.ts` 的异步上下文，不读请求字段
+ *（宿主不保证透传私有字段，理由见该模块头）。
+ */
+export declare function resolveEffectiveQueueWaitMode(): {
+    mode: QoderQueueWaitMode;
+    viaAggregate: boolean;
+};
+/**
  * 把 DSH 的工具 schema 映射成加密端点认的 `tools[]`。
  *
  * 形态取自客户端 `$Hc(A)`：
@@ -276,10 +319,21 @@ interface QoderWireMessage {
 export declare function buildQoderHistory(messages: readonly QoderWireMessage[]): QoderInferMessage[];
 /** `QoderAdapter` 的构造选项。 */
 export interface QoderAdapterOptions {
+    trafficGuardEnabled?: () => boolean;
     /** 默认凭据 ref（仅用于类型/日志，实际解析走 `resolveCredential`）。 */
     credentialRef: CredentialRef;
-    /** 从凭据存储解析凭据。 */
-    resolveCredential: (modelId?: string) => Promise<QoderCredential | undefined>;
+    /**
+     * 从凭据存储解析凭据。
+     *
+     * ⚠️⚠️ **第二参 sessionId 是「轮换起点」的作用域键**（用户 2026-11-11 报障）：
+     * 适配器必须把 `GenerateOptions.sessionId` 透传进来，否则选号层的
+     * `preferredRotationFor(provider, undefined)` 恒返回 `undefined`
+     * ⇒ **下拉框选了永远不生效、且零报错**。
+     *
+     * 这曾是一个真实缺陷：本接口原签名只有 `modelId`，全仓各适配器的
+     * 调用点**无一传 sessionId** ⇒ 功能上线后用户实测「选了 0959 仍用 4016」。
+     */
+    resolveCredential: (modelId?: string, sessionId?: string) => Promise<QoderCredential | undefined>;
     /** 静默续期凭据。 */
     refresh: () => Promise<void>;
     /** 多账号池（用于限流时切换账号与模型黑名单）。 */
@@ -400,6 +454,13 @@ export declare class QoderAdapter extends LlmAdapter {
     private readonly product;
     private readonly fetchImpl;
     /**
+     * **构造期**的全局 `fetch` 引用：判「是否注入了单测替身」的比较基准。
+     *
+     * ⚠️ 必须单独存一份，**不能**拿调用点的全局 `fetch` 当基准 —— 见
+     * {@link hasInjectedFetchImpl} 的失效形态。
+     */
+    private readonly baselineFetch;
+    /**
      * 按账号取出口 fetcher（`undefined` = 恒直连）。
      *
      * ⚠️ 与 `fetchImpl` **并存不是替代**：`fetchImpl` 是单测替身（优先级最高），
@@ -407,20 +468,34 @@ export declare class QoderAdapter extends LlmAdapter {
      */
     private readonly fetchFor;
     /**
-     * 出口 fetcher 是否被**单测替身**顶掉了（= 注入的 `fetchImpl` 不等于全局 `fetch`）。
+     * 出口 fetcher 是否被**单测替身**顶掉了（= 注入的 `fetchImpl` 不等于**构造期**的全局 `fetch`）。
      *
-     * ⚠️ 为什么用「`!==` 全局 `fetch`」而**不是**在构造期记一个
+     * ⚠️ 为什么用「引用不等于基准」而**不是**在构造期记一个
      * `options.fetchImpl !== undefined` 布尔：`ratelimit-misreport-behavior.spec.ts`
      * 这类既有用例是**构造后直接 `adapter.fetchImpl = 替身`** 的（拿不到构造参数），
      * 构造期布尔对它恒为 false ⇒ 实现落到 `fetchFor` / 全局 `fetch` ⇒ 真发网络，
      * 全量跑起来表现为 `expected 'TRANSPORT' to be 'QUOTA_EXCEEDED'`（本轮实测）。
-     * 而「引用不等于全局 `fetch`」这一判据**同时覆盖**「构造期注入」与「事后赋值」。
+     * 而「引用不等于基准」这一判据**同时覆盖**「构造期注入」与「事后赋值」。
+     *
+     * ⚠️⚠️ **基准必须是构造期快照，不能是调用点的全局 `fetch`**（真实缺陷，
+     * 2026-11-16 由宿主侧接入出站对齐层时暴露）：
+     *
+     * | 场景 | 拿全局 `fetch` 当基准（旧） | 拿构造期快照当基准（新） |
+     * |---|---|---|
+     * | 构造期注入替身 | 判为已注入 ✅ | 判为已注入 ✅ |
+     * | 构造后 `adapter.fetchImpl = 替身` | 判为已注入 ✅ | 判为已注入 ✅ |
+     * | **构造后全局 `fetch` 被包装**（宿主对齐层 / OTel 埋点 / mock server / 代理库） | **判为已注入 ❌** | 判为未注入 ✅ |
+     *
+     * 旧判据在最后一行会**静默跳过 `fetchFor`（per-账号出口代理）**，并回落到
+     * **构造期捕获的原始全局 `fetch`** ⇒ 换号只换了凭据、出口没换。症状与
+     * `2026-10-21` 那次真实报障同族：墙外环境下恒 connect 超时、且**无任何报错**，
+     * 该渠道从聚合轮换里静默消失。
      *
      * ⚠️ 也不能只把两个分支调序了事 —— `fetchImpl` 在构造期已被 `?? fetch` 填满，
      * 靠判空无法区分「注入」与「默认」。
      *
-     * ⚠️ 残余弱点（如实登记）：调用方注入一份**恰好等于全局 `fetch` 的引用**时会被
-     * 判成「未注入」—— 但那时两种语义**没有可观察差异**，不构成缺陷。
+     * ⚠️ 残余弱点（如实登记）：调用方注入一份**恰好等于构造期全局 `fetch` 的引用**时
+     * 会被判成「未注入」—— 但那时两种语义**没有可观察差异**，不构成缺陷。
      */
     private get hasInjectedFetchImpl();
     /**
@@ -777,8 +852,13 @@ export declare class QoderAdapter extends LlmAdapter {
      * 排队等待（HTTP 层与 SSE 层**共用**）。
      *
      * 两处形态必须走同一套判据，否则会再次出现「只修了一条路径」的缺陷。
+     *
+     * ⚠️ 自 2026-11-10 起该方法**是异步生成器**：`visible` 档要在等待期间产出
+     * 心跳帧，故调用方必须 `for await (…) yield frame` 而不是 `await` ——
+     * 直接 `await` 一个生成器只会拿到生成器对象、永远不执行（语法上不报错，
+     * 是最容易漏的改法）。
      */
-    private waitForQueue;
+    private waitForQueueFrames;
     /**
      * 确保凭据带 **`uid`**（加密推理必需），必要时经注入钩子补齐。
      *

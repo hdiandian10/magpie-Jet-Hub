@@ -154,7 +154,7 @@ export declare function buildLobsteraiModelsQuery(credential: LobsteraiCredentia
 export interface LobsteraiAdapterOptions {
     credentialRef: CredentialRef;
     /** 从凭据存储解析凭据。 */
-    resolveCredential: (modelId?: string) => Promise<LobsteraiCredential | undefined>;
+    resolveCredential: (modelId?: string, sessionId?: string) => Promise<LobsteraiCredential | undefined>;
     /** 静默续期凭据。 */
     refresh: () => Promise<void>;
     /** 动态拉取远端模型列表；失败时回退到 `product.fallbackModels`。 */

@@ -21,7 +21,7 @@
 import { Service } from '@deepseek-ai/cordis';
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import { isRaccoonExpired, isRaccoonRefreshable, raccoonCredentialExpiresAtMs, raccoonDisplayName, decodeJwtExpMs, } from './raccoon.js';
-import { claimRaccoonLoginReward, fetchRaccoonCreditBalance, fetchRaccoonOnboardingStatus, } from './raccoon-credits.js';
+import { claimRaccoonDailyCheckin, claimRaccoonLoginReward, fetchRaccoonCreditBalance, fetchRaccoonOnboardingStatus, } from './raccoon-credits.js';
 import { fetchRaccoonUserInfo, refreshRaccoonCredential, } from './raccoon-oauth.js';
 import { RACCOON, raccoonSupportsImage } from './raccoon-product.js';
 import { startRaccoonLoginFlow, } from './raccoon-login-page.js';
@@ -426,6 +426,15 @@ export class RaccoonAuth extends Service {
     /** 领取一次性登录奖励。 */
     async claimLoginReward(credential) {
         return claimRaccoonLoginReward(this.product, credential, this.fetchImpl);
+    }
+    /**
+     * 每日签到（办公端 `setting_info` 结算触发器 + 余额差核对）。
+     *
+     * ⚠️ 走实例方法而不是让 `provider-credits` 直接调自由函数：这样注入的
+     * `fetchImpl`（测试替身 / 代理）不会被绕过，与余额查询同一条口径。
+     */
+    async claimDailyCheckin(credential) {
+        return claimRaccoonDailyCheckin(this.product, credential, this.fetchImpl);
     }
     /** 查询一次性登录奖励是否已领。 */
     async fetchOnboardingStatus(credential) {

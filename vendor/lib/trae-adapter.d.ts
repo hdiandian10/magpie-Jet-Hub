@@ -42,7 +42,7 @@ export interface TraeAdapterOptions {
      *
      * 与 `LoomyAdapterOptions.resolveCredential` 同款（那里是既有正确实现）。
      */
-    resolveCredential: (modelId?: string) => Promise<TraeCredential | undefined>;
+    resolveCredential: (modelId?: string, sessionId?: string) => Promise<TraeCredential | undefined>;
     /** 静默续期凭据。 */
     refresh: () => Promise<void>;
     /** 动态拉取远端模型列表；失败时回退到 `product.fallbackModels`。 */

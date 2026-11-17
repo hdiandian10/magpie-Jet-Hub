@@ -36,6 +36,7 @@ import { ZCODE_CAPTCHA_FALLBACK } from './zcode-captcha.js';
 import { AccountPool, allAccountsRateLimitedForModel } from './account-pool.js';
 import { geminiFetchForAccount, setGeminiProxyPool } from './gemini-proxy.js';
 import { qoderFetchForAccount, setQoderProxyPool } from './qoder-proxy.js';
+import { qoderTrafficGuardEnabled } from './qoder-traffic-guard.js';
 import { foldReasonErrors } from './locked-error-text.js';
 import { MultiAccountRefreshScheduler } from './refresh-scheduler.js';
 import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js';
@@ -55,6 +56,8 @@ import { QODER, QODER_CN } from './qoder-product.js';
 import { TRAE } from './trae-product.js';
 import { CLINE } from './cline-product.js';
 import { configureDeadModelStore, withDeadModelPruning } from './dead-model-store.js';
+import { configureStrongestReasoningEnabled } from './reasoning-default.js';
+import { createReasoningPreferenceStore } from './reasoning-preferences.js';
 // 「锁定永久积分」的余额分档需要各家的余额查询函数：分档判据
 // （`splitBuddyCreditsByExpiry`）只读通用的 `packages[].{active, remaining,
 // deductionEndTime}`，故把各家的 fetch 指给同一个选择器即可（见各自接线处）。
@@ -173,7 +176,8 @@ import { ModelscopeAdapter, registerModelscopeLlm } from './modelscope-adapter.j
 import { MODELSCOPE } from './modelscope-product.js';
 import { modelscopeModelsUrl, modelscopeHeaders } from './modelscope.js';
 // 腾讯 Marvis（2026-11-09）。OpenAI 兼容 + OAuth 授权码（QQ / 微信），
-// 目录**只有** `main-auto` 一条（上游无目录端点），余额与推理同一个 host。
+// 目录**只有**一条（上行槽位 `deepseek-v4-pro-external`；上游无目录端点），
+// 余额与推理同一个 host。
 // 见 `src/marvis-product.ts` / `src/marvis-adapter.ts` 模块头。
 import { MarvisAuth } from './marvis-auth.js';
 import { MarvisAdapter, registerMarvisLlm } from './marvis-adapter.js';
@@ -638,24 +642,26 @@ export const probeById = {
         //    的取号权威本来就是那个回调（推理通道按 `activeAccountId` 现取、原生
         //    搜索也走它），为探测再造一个 override 字段会让两条路分叉。
         //    探测只有这一个账号 ⇒ 回调恒返回它，与生产语义一致。
-        createProbeAdapter: (ref, credential, entry) => new QoderAdapter({
+        createProbeAdapter: (ref, credential, entry, options) => new QoderAdapter({
             credentialRef: credentialRef(ref),
             resolveCredential: async () => credential,
             refresh: async () => { },
             product: QODER,
             fetchFor: qoderFetchForAccount,
             currentAccountId: () => entry?.id ?? '',
+            trafficGuardEnabled: () => options?.qoderTrafficGuardEnabled ?? qoderTrafficGuardEnabled(),
         }),
     },
     qodercn: {
         // 同上：两站共用同一个适配器类，只换 product。
-        createProbeAdapter: (ref, credential, entry) => new QoderAdapter({
+        createProbeAdapter: (ref, credential, entry, options) => new QoderAdapter({
             credentialRef: credentialRef(ref),
             resolveCredential: async () => credential,
             refresh: async () => { },
             product: QODER_CN,
             fetchFor: qoderFetchForAccount,
             currentAccountId: () => entry?.id ?? '',
+            trafficGuardEnabled: () => options?.qoderTrafficGuardEnabled ?? qoderTrafficGuardEnabled(),
         }),
     },
     // Cline → WorkOS 凭据 + 自己的端点。
@@ -1188,6 +1194,18 @@ export function apply(ctx) {
     // 解析。必须在任何 `registerXxxLlm` 之前调用 —— 各适配器经
     // `registerAdapterIdempotent` 注册时就会包装上剔除逻辑（见该函数注释）。
     configureDeadModelStore(ctx);
+    /**
+     * 「默认取最强思考档」开关（2026-11-11 用户功能，见 `reasoning-default.ts`）。
+     *
+     * ⚠️ **必须在这里接线，且早于任何 `registerXxxLlm`**：偏好是**每次请求现读**
+     * 的（回调形式），接线本身只是一次赋值，但放在注册之前能让「启动瞬间就有
+     * 模型请求」（标题生成等）也读到正确值。
+     *
+     * ⚠️ 偏好读的是 `ctx.logger` 与同一份 home 解析 —— 与账号池 / 徽标偏好
+     * 共用 `resolveJetHubHome`，几份文档永远落在同一目录。
+     */
+    const reasoningPreferences = createReasoningPreferenceStore(ctx);
+    configureStrongestReasoningEnabled(() => reasoningPreferences.load());
     // ===== Token 账本持久化（第 2 期 · 日聚合落盘）=====
     //
     // ⚠️ 账本本体是模块级单例（`token-ledger.ts`），没有 ctx 可拿 —— 故在启动时
@@ -1237,7 +1255,7 @@ export function apply(ctx) {
     // 与 buddy / workbuddy / lobsterai / qoder / trae 的既有做法一致。
     const codearts = registerCodeArtsLlm(ctx, {
         credentialRef: credentialRef(CODEARTS_CREDENTIAL_REF),
-        resolveCredential: async () => {
+        resolveCredential: async (modelId, sessionId) => {
             // CodeArts **只认账号池**，与其余五个 provider 一致。
             //
             // ⚠️ 早期它额外支持「单凭据模式」（`CODEARTS_ACCESS_TOKEN`）：登录后把凭据
@@ -1247,7 +1265,18 @@ export function apply(ctx) {
             //
             // 这里仍保留 `credentialRef` 选项，仅为满足适配器契约与报错文案
             // （其余 provider 同样传各自的默认 ref，但都不再作为回退来源）。
-            const available = await pool.getAvailableAccount('codearts', '');
+            // ⚠️⚠️ 「轮换起点」必须在这里解析成具体账号 id（PR #59 正向审计 P1-b）：
+            // codearts 原先**完全不认起点** —— 面板渲染下拉框、`account.setRotation`
+            // 落盘与回读都成功，但选号层从不读它，功能**静默失效且零报错**
+            //（适配器签名少一个参数，tsc 因函数参数逆变也不报）。
+            const rotationStartId = sessionId === undefined
+                ? undefined
+                : pool.preferredRotationFor('codearts', sessionId);
+            // WARN modelId 恒传空串：codearts 刻意不做模型级限流（见
+            // ratelimit-misreport-behavior.spec.ts 的「已知例外」一节）。PR #59 顺手
+            // 写成 modelId ?? '' 会让它开始按模型过滤 —— 症状是「限流标记把账号
+            // 筛空 ⇒ 取不到号 ⇒ 误报未登录」，正是该 spec 明写要防的第 13 个受害者。
+            const available = await pool.getAvailableAccount('codearts', '', undefined, rotationStartId);
             return available?.credential;
         },
         // 续期按**账号池里的具体账号**走：`refreshAccountCredential` 读写的是
@@ -2544,6 +2573,7 @@ export function apply(ctx) {
         fetchRemoteModels: () => qoder.fetchModels(pool),
         // 额度受限时标记「本次实际使用的账号」（理由见 `activeQoderAccountId` 注释）。
         currentAccountId: () => activeQoderAccountId.get(QODER.id),
+        trafficGuardEnabled: () => pool.qoderTrafficGuardEnabled(QODER.id),
         // ⚠️ **推理通道也必须走该账号的出口代理**（真实报障 2026-10-21）：
         //    国际版整站被 SNI 阻断，实测推理同样 10.7s `TRANSPORT: fetch failed`
         //    ⇒ 只接余额不接推理的话，面板显示正常但一发请求就超时。
@@ -2626,6 +2656,7 @@ export function apply(ctx) {
         // ⚠️ 取「**本次实际使用**的账号」而非池里默认那一个：池的默认账号可能与之
         // 不同（例如本账号被限流、池已切到别的账号），标错就会让标记落在无辜账号上。
         currentAccountId: () => activeQoderAccountId.get(QODER_CN.id),
+        trafficGuardEnabled: () => pool.qoderTrafficGuardEnabled(QODER_CN.id),
         // 同国际版：推理通道也要走该账号的出口代理（两站共用同一个适配器类）。
         fetchFor: qoderFetchForAccount,
     });
@@ -3883,7 +3914,8 @@ export function apply(ctx) {
     // ===== 腾讯 Marvis（2026-11-09）=====
     //
     // 形态：OpenAI 兼容（`/v1/chat/completions`）+ OAuth 授权码（QQ / 微信）。
-    // 目录**只有一条** `main-auto`（上游无目录端点，见 `src/marvis-product.ts`）。
+    // 目录**只有一条**（上行槽位 `deepseek-v4-pro-external`，见 `src/marvis-product.ts`；
+    // 上游无目录端点 ⇒ 静态兜底）。
     //
     // ⚠️ 与 modelscope / qiniu 的槽制同形：`slots()` 由**接线层**解析，适配器
     //    不直接读凭据库。区别只在槽里装的是 `MarvisCredential`（要放进请求头

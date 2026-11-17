@@ -754,10 +754,10 @@ export class ClineAdapter extends LlmAdapter {
             }
         }
         // 1. 获取凭据（过期则先静默续期）
-        let credential = await this.options.resolveCredential(options.model);
+        let credential = await this.options.resolveCredential(options.model, options.sessionId);
         if (credential === undefined || isClineExpired(credential)) {
             await this.options.refresh();
-            credential = await this.options.resolveCredential(options.model);
+            credential = await this.options.resolveCredential(options.model, options.sessionId);
         }
         if (credential === undefined || credential.access_token.length === 0) {
             throw new LlmError('cline: no usable credential; log in first', 'MISSING_CREDENTIAL');
@@ -836,7 +836,7 @@ export class ClineAdapter extends LlmAdapter {
                 throw new LlmError(`cline: ${errorDetail(forbiddenText)}`, 'PERMISSION_DENIED', { status: response.status });
             }
             await this.options.refresh();
-            const refreshed = await this.options.resolveCredential(options.model);
+            const refreshed = await this.options.resolveCredential(options.model, options.sessionId);
             if (refreshed === undefined || refreshed.access_token.length === 0) {
                 throw new LlmError('cline: credential expired and refresh failed', 'AUTH', { status: response.status });
             }

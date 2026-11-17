@@ -334,7 +334,7 @@ export class AstudioAdapter extends LlmAdapter {
      * 不带时流里没有 usage 帧，计费与统计双缺，故该键由 `buildAstudioChatRequest` 恒补）。
      */
     async *stream(options) {
-        const credential = await this.resolveCredentialImpl();
+        const credential = await this.resolveCredentialImpl(options.model, options.sessionId);
         if (credential === undefined || credential.access_token.length === 0) {
             throw new LlmError('astudio: 没有可用凭据；请在 AStudio 客户端登录后重试（本 provider 读磁盘 userdata\\astron-session.json）', 'MISSING_CREDENTIAL');
         }

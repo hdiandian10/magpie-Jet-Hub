@@ -30,13 +30,14 @@
 // capability 判据**同一函数**（它含 tool-result 递归），自己写一遍必然漂移。
 import { LlmAdapter, LlmError, ProviderRequestId, ReasoningEffortId, contentHasImage } from '@deepseek-ai/dsh-llm';
 import { buildVirtualModels } from './aggregate-catalog.js';
+import { bindAggregateDispatch } from './aggregate-dispatch-context.js';
 // ⚠️ `NEVER` / `UNUSABLE` **必须**从这里导入（Task 3 的共享底座）。它们从不在
 // `auto-adapter.ts` 里 `export` —— 从那里导入会编译失败（Task 3 复审已确认）。
 // ⚠️ `ExpiryProbe` 也在这里：它是**纯类型**，而 `aggregate-expiry.ts`（探针实现）
 // 与 `auto-adapter.ts` 都要引用它 ⇒ 放底座才能让两者都依赖底座而**不互相依赖**。
 // ⚠️ `resolveCandidateGate` / `CandidateGate` 也在这里：三态判据**只留这一份实现**
 //（面板渲染、选型报价、建池过滤都读它的结果，客户端读宿主下发的 `state`）。
-import { NEVER, UNUSABLE, rankCandidates, resolveCandidateGate, } from './aggregate-core.js';
+import { NEVER, UNUSABLE, pickDiversified, rankCandidates, resolveCandidateGate, } from './aggregate-core.js';
 import { CANONICAL_REASONING_EFFORTS, translateReasoningEffort } from './reasoning-ladder.js';
 import { registerAdapterIdempotent } from './llm-register-compat.js';
 // ⚠️ 目录落地的**广播**也只留一份实现（`catalog-broadcast.ts`）：12 家适配器都由
@@ -2111,9 +2112,19 @@ export class AggregateAdapter extends LlmAdapter {
         // ⚠️ `Promise.all` 而非 `allSettled`：中止（`AbortError`）必须原样逃逸
         //（与 `contextWindowFor` 同口径）；非中止的失败已被 `capabilityOf` 折算成
         // `resolved: false` 的保守值，不会让 `Promise.all` reject。
-        // ⚠️ **保序**：`Promise.all` 的结果与输入同序 ⇒ `targets` 的顺序仍是
-        // `rankCandidates` 给出的临期序（派发顺序是这个适配器的核心语义，绝不能乱）。
-        const picked = ranked.slice(0, limit);
+        // ⚠️ **轮内保序**：`Promise.all` 的结果与输入同序 ⇒ `targets` 在**每一轮内**都是
+        //   `rankCandidates` 给出的临期序（派发顺序是这个适配器的核心语义，绝不能乱）。
+        //   ⚠️ 但 `auto` 分支整体**不再是**临期序的子序列：`pickDiversified` 会把同渠道的
+        //   第 3 个及以后推迟到别家候选之后 ⇒ 依赖「`targets[0]` 就是临期最早」的逻辑
+        //   只在非 `auto` 上成立（`auto` 上只保证「第一家」是临期最早的）。
+        // ⚠️ `auto` 的池是所有渠道的所有模型：直接 `slice` 会让同一渠道占满名额（2026-11-14
+        //   生产故障：前 9 名全是 qoder，账号整体排队时 9 次切换全在 qoder 内部打转）。
+        //   ⇒ 第一轮每家最多 2 个、再按原序补齐（见 `pickDiversified`）。
+        //   ⚠️ 具名虚拟模型保持 `slice` 的原因**不是**「每家一个」——
+        //   `src/aggregate-catalog.ts` 的 `buildVirtualModels` 明文保留同渠道的重复候选；
+        //   真正的原因是**候选数本来就不超过名额**（`limit = maxAttemptsFor(catalog)` 是
+        //   「最长候选表的长度」）⇒ `slice` 一个都不截断，两条分支逐字节等价。
+        const picked = model === AGGREGATE_AUTO_MODEL ? pickDiversified(ranked, limit) : ranked.slice(0, limit);
         const capabilities = await Promise.all(picked.map((candidate) => this.capabilityOf(candidate.provider, candidate.realId, signal)));
         const targets = picked.map((candidate, index) => {
             const capability = capabilities[index];
@@ -2496,8 +2507,9 @@ export class AggregateAdapter extends LlmAdapter {
         // ⚠️⚠️ **必须先去重 + 封顶，再并发**（2026-10-20 独立审计实测的放大面）：
         //
         // `auto` 的候选表是 `autoCandidates()` = **全池去重**（实测 1–2 百条），而
-        // `candidatesFor` 那条路径有 `ranked.slice(0, limit)`（`maxAttemptsFor`，实测 14）
-        // 封顶。本方法原先**没有任何封顶** ⇒ 一次 `auto` 的窗口推导会同时发起全池
+        // 派发路径（`dispatch()` 里的 `picked`）本来就封顶到 `maxAttemptsFor`（实测 14；
+        // `auto` 走 `pickDiversified`、具名模型走 `slice`，两者都不超过该值）。
+        // 本方法原先**没有任何封顶** ⇒ 一次 `auto` 的窗口推导会同时发起全池
         // 条 `resolveModelInfo`；再叠加宿主 `buildModelCatalog` 对**每个模型**的并行
         // 调用 ⇒ 实测峰值在飞 **364**（14 渠道 × 13 模型）、只解析 `auto` 时 **182**。
         //
@@ -2631,7 +2643,30 @@ export class AggregateAdapter extends LlmAdapter {
                  */
                 let pendingProvider;
                 try {
-                    for await (const chunk of self.streamThrough(target, options)) {
+                    // ⚠️ 派发必须带上「聚合调用」标记（见 `aggregate-dispatch-context.ts`）：
+                    //    渠道据此把「暂时排队」改判为「本候选失败」，让这里能切到下一个候选，
+                    //    而不是被 qoder 的排队等待锁死（2026-11-14 生产故障）。
+                    //
+                    // ⚠️⚠️ **但只在「还有下一个候选」时才挂标记**（真实回归，对抗审计 + 独立
+                    //    复现双双实测）：挂上标记后渠道把排队判成本候选失败，而失败后的切换
+                    //    条件是 `index + 1 < targets.length` —— 本候选是**最后一个**时无处可切，
+                    //    于是**本可恢复的排队被翻成硬失败**。
+                    //
+                    //    实测（`tests/unit/aggregate-qoder-single-candidate.spec.ts`）：单候选
+                    //    虚拟模型 + 上游排队两次后第 3 次恢复 ⇒ 不挂标记时拿到 `ok`（等了 2 次），
+                    //    挂标记时立刻 `code=QUEUE` 失败。单候选是**常态**而非边缘情况 ——
+                    //    `buildVirtualModels()`（`src/aggregate-catalog.ts`）不按 `candidates >= 2`
+                    //    过滤，任何渠道**独有**的模型（如 qoder 的 `ultimate`、`performance`）
+                    //    在聚合里都只有一个候选。
+                    //
+                    //    最后一个候选没有退路，「等」总比「死」好；用户显式设
+                    //    `DSH_QODER_QUEUE_WAIT_MODE=fast` 时仍会立即失败 —— 那是用户的选择，
+                    //    由 `resolveQueueWaitMode()` 负责，与本标记无关。
+                    const hasNextCandidate = index + 1 < targets.length;
+                    const stream = hasNextCandidate
+                        ? bindAggregateDispatch(() => self.streamThrough(target, options))
+                        : self.streamThrough(target, options);
+                    for await (const chunk of stream) {
                         // ⚠️⚠️ **必须在置 `emitted` 之前**判这个失败帧（顺序是语义性的）。
                         //
                         // 为什么需要这一段：`streamThrough` 走的是**嵌套公共入口**

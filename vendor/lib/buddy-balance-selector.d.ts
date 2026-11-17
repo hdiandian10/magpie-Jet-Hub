@@ -402,6 +402,25 @@ export declare function pickBuddyAccount<TCredential = BuddyCredential>(selector
      * 共用一条通道 —— 将来谁给 `tierOptions` 换形状都会连带改掉选号策略。
      */
     strictManualOrder?: boolean;
+    /**
+     * 「轮换起点」：本会话指定的起始账号 id（`undefined` = 默认起点）。
+     *
+     * 与 {@link BuddyTierOptions.rotationStartId} 同义 —— 本字段只是把它从
+     * resolver 透传到 `selector.select()` 的**通道**，判据仍只有一处
+     * （`rotateFromPreferred`）。
+     */
+    rotationStartId?: string;
+    /**
+     * 「轮换起点的定位基准」：**全量启用账号**的 id 列表（池序、不过滤封禁/限流）。
+     *
+     * 与 {@link BuddyTierOptions.enabledAccountIds} 同义 —— 本字段只是把它从
+     * resolver 透传到 `selector.select()` 的**通道**，判据仍只有一处
+     * （`rotateFromPreferred`）。
+     *
+     * ⚠️ 存在的理由（PR #59 正向审计 P1-a）：起点账号被封禁 / 被目标模型限流时
+     * 它**不在候选集里**，只按 `ranked.findIndex(id)` 会静默回落默认第一个号。
+     */
+    enabledAccountIds?: readonly string[];
 }): Promise<{
     kind: 'account';
     account: BuddyCandidateAccount;

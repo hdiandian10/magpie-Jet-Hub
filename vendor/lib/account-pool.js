@@ -1,8 +1,10 @@
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
-import { createJetHubStore, clearRejectionLayer, DEFAULT_PANEL_ENTRY, isValidResetAtMs, MAX_DATE_MS, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeDisabledModels, sanitizeMinimaxXff, sanitizePanelEntry, sanitizePermanentLocks, sanitizeProviderClosed, sanitizeStrictManualOrder, withAllowed, withoutAllowed } from './jet-hub-store.js';
+import { createJetHubStore, clearRejectionLayer, DEFAULT_PANEL_ENTRY, isValidResetAtMs, MAX_DATE_MS, mergeLegacyLoomyLock, sanitizeAccounts, sanitizeDisabledModels, sanitizeMinimaxXff, sanitizePanelEntry, sanitizePermanentLocks, sanitizePreferredRotation, sanitizeProviderClosed, sanitizeStrictManualOrder, withAllowed, withoutAllowed } from './jet-hub-store.js';
 import { createPermanentLockStore } from './permanent-lock-store.js';
 import { normalizeOpencodeGeneration } from './opencode-auth.js';
 import { maskProxyPassword } from './proxy-mask.js';
+import { qoderWebRefName } from './qoder-web-usage.js';
+import { qoderTrafficGuardEnabled } from './qoder-traffic-guard.js';
 // ⚠️ `model-queue.ts` **零 import**（纯函数模块，见其模块头）⇒ 不引入环。
 import { nextUtc8DayStartMs } from './model-queue.js';
 import { readTokenLedgerDayMap, utc8DayKey } from './token-ledger.js';
@@ -278,6 +280,35 @@ export function proxyLogText(value) {
 export function isPolicyBlockedAccount(entry) {
     return isValidResetAtMs(entry.policyBlockedAtMs);
 }
+/**
+ * 「轮换起点」在**无余额档位**路径上的旋转（池选号专用）。
+ *
+ * ## 与 `buddy-balance-rank.ts` 的 `rotateFromPreferred` 的分工
+ *
+ * | | 本函数 | `rotateFromPreferred` |
+ * |---|---|---|
+ * | 用于 | 池选号（codearts / cline / gemini / opencode …） | 余额分档渠道（buddy 系 / trae / qoder …） |
+ * | 判可用性 | **不需要** —— 候选已过 enabled / 封禁 / 限流 ⇒ 全是可用项 | 需要（锁定永久积分时「只剩永久」不可用） |
+ * | 语义 | 纯旋转 | 旋转 + **起点跳到往后第一个可用项** |
+ *
+ * ⚠️ **刻意不合并**：合并会把「需要余额才能判可用性」这件事带进池选号路径，
+ *    而那条路径**拿不到余额**（也不该为它查一次）。
+ *
+ * ## 三条不变量
+ *
+ * 1. **集合不变**：只旋转，不增删；
+ * 2. **保序**：起点前后各保持原相对顺序；
+ * 3. **找不到 / 首位 ⇒ 原样**（仍返回新数组，不改入参）。
+ */
+function rotateFromAccountId(candidates, rotationStartId) {
+    const copy = [...candidates];
+    if (rotationStartId === undefined || rotationStartId.length === 0)
+        return copy;
+    const index = copy.findIndex((c) => c.id === rotationStartId);
+    if (index <= 0)
+        return copy;
+    return [...copy.slice(index), ...copy.slice(0, index)];
+}
 export class AccountPool {
     ctx;
     /** 持久化后端；两个后端都不可用时是仅内存实现。 */
@@ -364,6 +395,7 @@ export class AccountPool {
      * 的唯一后果是回到默认启用，用户再关一次即可。
      */
     gatewayEnabledCache = true;
+    qoderTrafficGuard = {};
     /**
      * 「允许局域网访问」开关的进程内副本（2026-10-20）。
      *
@@ -405,6 +437,7 @@ export class AccountPool {
      * 「用户仍需要显式开一次开关」，那是可见、可逆的。
      */
     strictManualOrderCache = {};
+    preferredRotationCache = {};
     /**
      * 「面板入口」的进程内副本：Jet Hub 的唯一入口位置（两个取值互斥）。
      *
@@ -540,6 +573,7 @@ export class AccountPool {
             this.aggregateOrderModeCache = state.aggregateOrderMode === 'manual' ? 'manual' : 'expiry';
             // 网关开关同理：老文档没有该键 → 保持默认启用。
             this.gatewayEnabledCache = state.gatewayEnabled !== false;
+            this.qoderTrafficGuard = state.qoderTrafficGuard ?? {};
             // 局域网开关同理：老文档没有该键 → 保持默认关闭（安全默认，暴露面变大
             // 必须是显式选择）。与 store 侧 `sanitizeGatewayAllowLan` 同一判据。
             this.gatewayAllowLanCache = state.gatewayAllowLan === true;
@@ -562,6 +596,7 @@ export class AccountPool {
             // 严格手动顺序同理：老文档没有该键 → 空表（= 全部走余额分档，与升级前一致）。
             // 过一遍 sanitize：老契约后端可能绕过 schema 直接给出原始文档。
             this.strictManualOrderCache = sanitizeStrictManualOrder(state.strictManualOrder);
+            this.preferredRotationCache = sanitizePreferredRotation(state.preferredRotation);
         }
         this.loadLocks(state);
     }
@@ -631,53 +666,60 @@ export class AccountPool {
      * `.catch()` 派生量更新 {@link storeChain}，让**链本身不被一次失败打断**
      * ——否则后续所有写都会跟着拒绝，账号池进入永不落盘状态。
      */
-    queueStoreSave() {
-        if (this.store.kind === 'memory')
+    queueStoreSave(qoderUpdate) {
+        if (this.store.kind === 'memory' && qoderUpdate === undefined)
             return Promise.resolve();
         const next = this.storeChain.then(async () => {
-            await this.store.save({
-                accounts: this.cache,
-                disabledModels: this.modelCache,
-                // 与上面两份同源快照（见本方法注释：分两次快照会让同一份文档里的字段互相矛盾）。
-                aggregateRejections: this.aggregateRejectionCache,
-                // ⚠️⚠️ 三个新键**必须**与上面取自**同一时刻**的快照（`replace` 是整体替换语义）：
-                //    漏一个 ⇒ 该键永不落盘，且**任何**账号/黑名单写入都会顺带把它抹掉。
-                //    其中白名单丢失属「静默改路由」（用户手工打开的无临期渠道悄悄回到不参与）。
-                aggregateAllowed: this.aggregateAllowedCache,
-                aggregateOrder: this.aggregateOrderCache,
-                aggregateOrderMode: this.aggregateOrderModeCache,
-                ...this.lockFields(),
-                // ⚠️ 必须与账号、黑名单取自**同一时刻**的快照（见本方法的注释）：
-                // 分两次快照会让同一份文档里的字段互相矛盾。
-                gatewayEnabled: this.gatewayEnabledCache,
-                // ⚠️ 必须与上面取自同一时刻的快照（replace 是整体替换语义）：
-                //    漏键 ⇒ 用户打开的「允许局域网访问」在任何一次其它写入时被抹掉，
-                //    重启后静默回到只绑回环（用户会以为开关坏了）。
-                gatewayAllowLan: this.gatewayAllowLanCache,
-                nativeWebSearchEnabled: this.nativeWebSearchCache,
-                // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同一个整体替换陷阱）：
-                //    漏键会让用户明确关闭的「会话负载均衡」在任何一次其它写入时被抹掉，
-                //    重启后静默回到开启。
-                sessionBalanceEnabled: this.sessionBalanceCache,
-                // ⚠️ **必须带上本键**（与上面几个新键是同一个 `replace` 整体替换陷阱）：
-                //    漏键 ⇒ 用户开过的「严格手动顺序」在**任何**一次其它写入时被抹掉，
-                //    重启后静默回到余额分档优先（用户只看到「拖拽又不灵了」）。
-                strictManualOrder: this.strictManualOrderCache,
-                // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同一个整体替换陷阱）：
-                //    漏键会让用户改过的面板入口在**任何**一次账号/黑名单/网关/顺序写入时
-                //    被静默清掉，重启后入口又变回默认「仅侧栏」。
-                panelEntry: this.panelEntryCache,
-                providerOrder: this.providerOrderCache,
-                // ⚠️ **必须带上本键**（同 `nativeWebSearchEnabled` 的坑）：
-                //    `write` 是整体替换语义 ⇒ 漏键会让用户设的 XFF 在**任何**一次
-                //    改账号 / 改黑名单 / 改网关 / 拖顺序时被静默清掉，
-                //    症状是「国际站明明设好了 XFF，过一阵又开始 307」。
-                minimaxXff: this.minimaxXffCache,
-                // ⚠️⚠️ **必须与上面几份取自同一时刻的快照**（`replace` 是整体替换语义）：
-                //    漏键 ⇒ 关闭意图**永不落盘**，且任何账号/黑名单写入都会把它抹掉
-                //    ⇒ 重启后供应商静默回到「已打开」（Gitee issue IKP8OF 原样复发）。
-                providerClosed: this.providerClosedCache,
-            });
+            const qoderTrafficGuard = qoderUpdate === undefined
+                ? this.qoderTrafficGuard
+                : { ...this.qoderTrafficGuard, [qoderUpdate.provider]: qoderUpdate.enabled };
+            if (this.store.kind !== 'memory')
+                await this.store.save({
+                    accounts: this.cache,
+                    disabledModels: this.modelCache,
+                    // 与上面两份同源快照（见本方法注释：分两次快照会让同一份文档里的字段互相矛盾）。
+                    aggregateRejections: this.aggregateRejectionCache,
+                    // ⚠️⚠️ 三个新键**必须**与上面取自**同一时刻**的快照（`replace` 是整体替换语义）：
+                    //    漏一个 ⇒ 该键永不落盘，且**任何**账号/黑名单写入都会顺带把它抹掉。
+                    //    其中白名单丢失属「静默改路由」（用户手工打开的无临期渠道悄悄回到不参与）。
+                    aggregateAllowed: this.aggregateAllowedCache,
+                    aggregateOrder: this.aggregateOrderCache,
+                    aggregateOrderMode: this.aggregateOrderModeCache,
+                    ...this.lockFields(),
+                    // ⚠️ 必须与账号、黑名单取自**同一时刻**的快照（见本方法的注释）：
+                    // 分两次快照会让同一份文档里的字段互相矛盾。
+                    gatewayEnabled: this.gatewayEnabledCache,
+                    qoderTrafficGuard,
+                    // ⚠️ 必须与上面取自同一时刻的快照（replace 是整体替换语义）：
+                    //    漏键 ⇒ 用户打开的「允许局域网访问」在任何一次其它写入时被抹掉，
+                    //    重启后静默回到只绑回环（用户会以为开关坏了）。
+                    gatewayAllowLan: this.gatewayAllowLanCache,
+                    nativeWebSearchEnabled: this.nativeWebSearchCache,
+                    // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同一个整体替换陷阱）：
+                    //    漏键会让用户明确关闭的「会话负载均衡」在任何一次其它写入时被抹掉，
+                    //    重启后静默回到开启。
+                    sessionBalanceEnabled: this.sessionBalanceCache,
+                    // ⚠️ **必须带上本键**（与上面几个新键是同一个 `replace` 整体替换陷阱）：
+                    //    漏键 ⇒ 用户开过的「严格手动顺序」在**任何**一次其它写入时被抹掉，
+                    //    重启后静默回到余额分档优先（用户只看到「拖拽又不灵了」）。
+                    strictManualOrder: this.strictManualOrderCache,
+                    preferredRotation: this.preferredRotationCache,
+                    // ⚠️ **必须带上本键**（与 `nativeWebSearchEnabled` 同一个整体替换陷阱）：
+                    //    漏键会让用户改过的面板入口在**任何**一次账号/黑名单/网关/顺序写入时
+                    //    被静默清掉，重启后入口又变回默认「仅侧栏」。
+                    panelEntry: this.panelEntryCache,
+                    providerOrder: this.providerOrderCache,
+                    // ⚠️ **必须带上本键**（同 `nativeWebSearchEnabled` 的坑）：
+                    //    `write` 是整体替换语义 ⇒ 漏键会让用户设的 XFF 在**任何**一次
+                    //    改账号 / 改黑名单 / 改网关 / 拖顺序时被静默清掉，
+                    //    症状是「国际站明明设好了 XFF，过一阵又开始 307」。
+                    minimaxXff: this.minimaxXffCache,
+                    // ⚠️⚠️ **必须与上面几份取自同一时刻的快照**（`replace` 是整体替换语义）：
+                    //    漏键 ⇒ 关闭意图**永不落盘**，且任何账号/黑名单写入都会把它抹掉
+                    //    ⇒ 重启后供应商静默回到「已打开」（Gitee issue IKP8OF 原样复发）。
+                    providerClosed: this.providerClosedCache,
+                });
+            this.qoderTrafficGuard = qoderTrafficGuard;
         });
         this.storeChain = next.catch(() => { });
         return next;
@@ -1089,6 +1131,14 @@ export class AccountPool {
         this.ensureLoaded();
         return this.gatewayEnabledCache;
     }
+    qoderTrafficGuardEnabled(provider) {
+        this.ensureLoaded();
+        return this.qoderTrafficGuard[provider] ?? qoderTrafficGuardEnabled();
+    }
+    setQoderTrafficGuardEnabled(provider, enabled) {
+        this.ensureLoaded();
+        return this.queueStoreSave({ provider, enabled });
+    }
     /**
      * 打开/关闭本机 OpenAI 网关并落盘。
      *
@@ -1238,6 +1288,106 @@ export class AccountPool {
         this.loaded = true;
         if (this.store.kind === 'memory') {
             this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，严格手动顺序开关仅本次会话有效');
+            return;
+        }
+        await this.queueStoreSave();
+    }
+    /**
+     * 「轮换起点」：某 provider 在某**会话**下指定的起始账号 id。
+     *
+     * `undefined` = 默认起点（不干预）。**只挪起点，不改任何选号策略**。
+     *
+     * ⚠️ 空 `sessionId` 恒返回 `undefined` —— 空串会让「默认」与「某会话」撞成同一个键。
+     * ⚠️ **每次现读，不缓存**：用户随时可能在面板上改。
+     * ⚠️ 返回的 id **可能已失效**（账号被删/停用）：本方法不做存在性校验，
+     *    消费方按「找不到就原样」处理（见 `rotateFromPreferred`）。
+     */
+    preferredRotationFor(provider, sessionId) {
+        this.ensureLoaded();
+        if (provider.length === 0)
+            return undefined;
+        if (typeof sessionId !== 'string' || sessionId.length === 0)
+            return undefined;
+        const entry = this.preferredRotationCache[provider]?.[sessionId];
+        if (entry === undefined)
+            return undefined;
+        /**
+         * ⚠️ **只数「启用」账号**（与下拉框、`account.getRotation` 同口径）。
+         *    停用账号在 UI 上根本不出现，若把它算进位次会让两边错位。
+         */
+        const enabled = this.readAccounts()
+            .filter((a) => a.provider === provider && a.enabled !== false);
+        /**
+         * ## ⚠️ 三种历史格式都要认（任一崩掉都是「读偏好直接失败」）
+         *
+         * | 形态 | 来源 | `in` 运算符安全吗 |
+         * |---|---|---|
+         * | 裸字符串 `"acc-id"` | 本功能最早那版 | ❌ **会抛 TypeError** |
+         * | `{ accountId, at }` | 早期版本 | ✅ |
+         * | `{ position, at }` | 本版起 | ✅ |
+         *
+         * ⚠️ **真实缺陷（2026-11-10）**：原写 `'accountId' in entry`，遇到裸字符串
+         *    直接抛 `TypeError: Cannot use 'in' operator to search for 'position' in …`
+         *    ⇒ 读偏好失败 ⇒ 下拉框**永远显示「默认」**（用户报障的正是这个）。
+         * ⚠️ `sanitizePreferredRotation` 会**原样保留**裸字符串（不转换），
+         *    因为它的注释说「补 `at = 0`」—— 但那是**对象**形态，字符串那支没转换。
+         *    ⇒ 这里必须自己判 `typeof entry === 'string'`。
+         */
+        // ① 裸字符串（最老格式）：直接当 accountId
+        if (typeof entry === 'string') {
+            return entry.length > 0 ? entry : undefined;
+        }
+        // ② 旧对象格式 `{ accountId, at }`：仍跟随该账号
+        if (typeof entry === 'object' && entry !== null && 'accountId' in entry) {
+            return entry.accountId.length > 0 ? entry.accountId : undefined;
+        }
+        /**
+         * 新格式：**位次 → 当前账号**（用户 2026-11-10 要求「跟随位次」）。
+         *
+         * ⚠️ 三条边界**全部回落默认**，绝不 clamp —— clamp 会在账号变少时
+         *    **静默**把设置挪到别的号上，而「回落默认」至少是用户能理解的行为。
+         */
+        const index = entry.position - 1;
+        if (index < 0 || index >= enabled.length)
+            return undefined;
+        return enabled[index].id;
+    }
+    /**
+     * 写入「轮换起点」；`accountId` 传 `null` = 恢复默认起点。
+     *
+     * ⚠️ 与 {@link setStrictManualOrder} 同款：走同一条写队列（`queueStoreSave`），
+     * 不能自己 `store.save(...)` —— 那会与账号/黑名单的写入乱序覆盖。
+     * ⚠️ 稀疏表：`null` 时**删键**，整层空了连 provider 层一起删
+     *    （与 `sanitizePreferredRotation`「空层不保留」对称）。
+     */
+    async setPreferredRotation(provider, sessionId, position) {
+        this.ensureLoaded();
+        if (provider.length === 0 || sessionId.length === 0)
+            return;
+        // ⚠️ 位次必须是正整数（1-based）；`null` = 恢复默认
+        if (position !== null && (!Number.isInteger(position) || position < 1))
+            return;
+        const current = this.preferredRotationCache[provider]?.[sessionId];
+        const currentPosition = typeof current === 'object' && current !== null && 'position' in current
+            ? current.position
+            : null;
+        if (position === currentPosition)
+            return;
+        const next = { ...this.preferredRotationCache };
+        const sessions = { ...(next[provider] ?? {}) };
+        // ⚠️ 写入时**带上 at**：淘汰按它排序（见 `prunePreferredRotation`）。
+        if (position === null)
+            delete sessions[sessionId];
+        else
+            sessions[sessionId] = { position, at: Date.now() };
+        if (Object.keys(sessions).length > 0)
+            next[provider] = sessions;
+        else
+            delete next[provider];
+        this.preferredRotationCache = sanitizePreferredRotation(next);
+        this.loaded = true;
+        if (this.store.kind === 'memory') {
+            this.ctx.logger?.warn?.('[jet-hub] 无持久化后端，轮换起点仅本次会话有效');
             return;
         }
         await this.queueStoreSave();
@@ -2082,6 +2232,20 @@ export class AccountPool {
             await this.ctx.credentials.unset(credentialRef(entry.credentialRef));
         }
         catch { /* 凭据可能已被删除 */ }
+        /**
+         * Qoder 的网页会话 Cookie 与领取记录存在独立条目里，随账号一并清理。
+         *
+         * ⚠️⚠️ **后缀必须走 `qoderWebRefName()`，不许在这里内联 `${ref}_web`**
+         * （2026-11-14 对抗审计 P2-⑥；本仓红线「同一判据只留一份实现」）：两处各拼一次
+         * 时，将来改命名规则（比如加版本后缀）会只改一处 ⇒ 删号时**漏清 Cookie**，
+         * 而漏清是**静默**的（没人看得到凭据库里多了一条能登录官网的会话）。
+         */
+        if (entry.provider === 'qoder' || entry.provider === 'qodercn') {
+            try {
+                await this.ctx.credentials.unset(credentialRef(qoderWebRefName(entry.credentialRef)));
+            }
+            catch { /* 本就不存在 */ }
+        }
         // ⚠ **必须重新读一次**（真实缺陷，审查发现）：`credentials.unset` 会挂起若干
         // 微任务/IO，期间并发的 `addAccount` 已经把新条目写进 `this.cache` 与磁盘。
         // 若此时拿 `await` **之前**的快照做 filter 再整体写回，那个新账号会被静默丢失
@@ -2570,7 +2734,14 @@ export class AccountPool {
      * 还有测试桩与 `ResolverPool` 这类结构化替身，去掉默认值会让它们全部编译失败，
      * 而它们本就不关心具体形状。
      */
-    async getAvailableAccount(provider, modelId, excludeAccountIds) {
+    async getAvailableAccount(provider, modelId, excludeAccountIds, 
+    /**
+     * 「轮换起点」：本会话指定的起始账号 id（可选；`undefined` = 默认起点）。
+     *
+     * ⚠️ **只旋转，不增删** —— 它不可用时仍会选中别的号（`tried` 循环照旧）。
+     * ⚠️ 本路径**没有余额档位**（候选已过 enabled / 封禁 / 限流）⇒ 纯旋转即可。
+     */
+    rotationStartId) {
         const candidates = this.candidateAccounts(provider, modelId, excludeAccountIds);
         if (candidates.length === 0)
             return null;
@@ -2584,7 +2755,7 @@ export class AccountPool {
         //
         // 注意 candidates 来自 readAccounts() 的 filter，而 filter 保持原数组
         // 顺序，故这里天然就是手动顺序，无需任何排序。
-        return await this.resolveFirstCredential(provider, candidates);
+        return await this.resolveFirstCredential(provider, rotateFromAccountId(candidates, rotationStartId));
     }
     /**
      * 按 **sessionId** 选号（ZCode 专用，2026-10-30 用户要求）。

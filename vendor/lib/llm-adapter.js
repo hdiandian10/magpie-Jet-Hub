@@ -1,5 +1,6 @@
 import { attributionHeaders, CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError, isQuotaExceededError, LlmAdapter, LlmError, } from '@deepseek-ai/dsh-llm';
 import { ReasoningEffortId, ToolCallId } from '@deepseek-ai/dsh-llm';
+import { isInsideAggregateDispatch } from './aggregate-dispatch-context.js';
 import { createModelCatalog, isCatalogFreshFor } from './model-catalog.js';
 import { RemoteCatalogGate } from './remote-catalog-gate.js';
 import { broadcastCatalogChanged } from './catalog-broadcast.js';
@@ -1980,10 +1981,10 @@ export class CodeArtsAdapter extends LlmAdapter {
         };
     }
     async *stream(options) {
-        let credential = await this.options.resolveCredential();
+        let credential = await this.options.resolveCredential(options.model, options.sessionId);
         if (credential === undefined || Date.parse(credential.expires_at) <= Date.now()) {
             await this.options.refresh();
-            credential = await this.options.resolveCredential();
+            credential = await this.options.resolveCredential(options.model, options.sessionId);
         }
         if (credential === undefined || !credential.access_key_id || !credential.secret_access_key || !credential.security_token) {
             throw new LlmError('codearts: no usable credential; log in first', 'MISSING_CREDENTIAL');
@@ -2523,7 +2524,7 @@ export class CodeArtsAdapter extends LlmAdapter {
                 if (isAuthError(response.status, errorText) && !authRefreshed) {
                     authRefreshed = true;
                     await this.options.refresh();
-                    credential = await this.options.resolveCredential();
+                    credential = await this.options.resolveCredential(options.model, options.sessionId);
                     if (credential === undefined || !credential.access_key_id || !credential.secret_access_key || !credential.security_token) {
                         throw new LlmError('codearts: credential missing after refresh; log in again', 'MISSING_CREDENTIAL');
                     }
@@ -2725,6 +2726,16 @@ export class CodeArtsAdapter extends LlmAdapter {
             // 保持静默，web 显示 harness 自身的"运行中"状态。每次重试前查询
             // 状态端点：终态（error/queue_full）立即抛错，其余情况
             // （waiting/working/端点不可达）等待后直接重试 chat。
+            //
+            // ⚠️⚠️ **聚合调用不等待，立刻按 `QUEUE` 失败**（2026-11-14，与 qoder 同一故障形态）：
+            //    聚合只在候选**报错**时切换下一个候选，而这里的排队是**静默**重试（最长
+            //    30 分钟、不产出任何帧）⇒ 聚合等不到错误，请求被锁死在本渠道，客户端一个字节
+            //    都收不到。判据见 `aggregate-dispatch-context.ts`；直连 codearts 时没有
+            //    「下一个候选」，仍走下方的排队等待，行为不变。
+            if (isInsideAggregateDispatch()) {
+                console.warn(`[codearts] 上游排队（${options.model}）：聚合调用不等待，交由聚合切换下一个候选`);
+                throw new LlmError(`codearts: 上游模型排队中（${options.model}，聚合调用不等待，交由聚合切换下一个候选）`, 'QUEUE');
+            }
             queueAttempts += 1;
             if (queueAttempts > QUEUE_MAX_ATTEMPTS) {
                 throw new LlmError('codearts: queue wait timed out after 30 minutes', 'QUEUE');

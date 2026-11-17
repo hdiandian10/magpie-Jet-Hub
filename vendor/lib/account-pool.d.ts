@@ -2,6 +2,7 @@ import { Context } from '@deepseek-ai/cordis';
 import type { BuddyCredential } from './buddy.js';
 import type { BuddyProduct } from './product.js';
 import type { AggregateAllowedMap, AggregateOrderMap, AggregateOrderMode, AggregateRejectionMap, JetHubState, ModelDisableMap, PanelEntry, PermanentLockMap } from './jet-hub-store.js';
+import { type QoderTrafficProvider } from './qoder-traffic-guard.js';
 import type { CodeArtsCredential, ProviderAccountEntry, ProviderAccountStatus } from './types.js';
 export { JET_HUB_NS } from './jet-hub-store.js';
 export type { ModelDisableMap, ProviderClosedMap } from './jet-hub-store.js';
@@ -269,6 +270,7 @@ export declare class AccountPool {
      * 的唯一后果是回到默认启用，用户再关一次即可。
      */
     private gatewayEnabledCache;
+    private qoderTrafficGuard;
     /**
      * 「允许局域网访问」开关的进程内副本（2026-10-20）。
      *
@@ -310,6 +312,7 @@ export declare class AccountPool {
      * 「用户仍需要显式开一次开关」，那是可见、可逆的。
      */
     private strictManualOrderCache;
+    private preferredRotationCache;
     /**
      * 「面板入口」的进程内副本：Jet Hub 的唯一入口位置（两个取值互斥）。
      *
@@ -660,6 +663,8 @@ export declare class AccountPool {
      * {@link gatewayEnabledCache}。
      */
     gatewayEnabled(): boolean;
+    qoderTrafficGuardEnabled(provider: QoderTrafficProvider): boolean;
+    setQoderTrafficGuardEnabled(provider: QoderTrafficProvider, enabled: boolean): Promise<void>;
     /**
      * 打开/关闭本机 OpenAI 网关并落盘。
      *
@@ -736,6 +741,26 @@ export declare class AccountPool {
      * 不能自己 `store.save(...)` —— 那会与账号/黑名单的写入乱序覆盖。
      */
     setStrictManualOrder(provider: string, enabled: boolean): Promise<void>;
+    /**
+     * 「轮换起点」：某 provider 在某**会话**下指定的起始账号 id。
+     *
+     * `undefined` = 默认起点（不干预）。**只挪起点，不改任何选号策略**。
+     *
+     * ⚠️ 空 `sessionId` 恒返回 `undefined` —— 空串会让「默认」与「某会话」撞成同一个键。
+     * ⚠️ **每次现读，不缓存**：用户随时可能在面板上改。
+     * ⚠️ 返回的 id **可能已失效**（账号被删/停用）：本方法不做存在性校验，
+     *    消费方按「找不到就原样」处理（见 `rotateFromPreferred`）。
+     */
+    preferredRotationFor(provider: string, sessionId: string | undefined): string | undefined;
+    /**
+     * 写入「轮换起点」；`accountId` 传 `null` = 恢复默认起点。
+     *
+     * ⚠️ 与 {@link setStrictManualOrder} 同款：走同一条写队列（`queueStoreSave`），
+     * 不能自己 `store.save(...)` —— 那会与账号/黑名单的写入乱序覆盖。
+     * ⚠️ 稀疏表：`null` 时**删键**，整层空了连 provider 层一起删
+     *    （与 `sanitizePreferredRotation`「空层不保留」对称）。
+     */
+    setPreferredRotation(provider: string, sessionId: string, position: number | null): Promise<void>;
     /**
      * 「面板入口」的当前取值：Jet Hub 的唯一入口位置。
      *
@@ -1344,7 +1369,14 @@ export declare class AccountPool {
      * 还有测试桩与 `ResolverPool` 这类结构化替身，去掉默认值会让它们全部编译失败，
      * 而它们本就不关心具体形状。
      */
-    getAvailableAccount<TCredential = CodeArtsCredential | BuddyCredential>(provider: string, modelId: string, excludeAccountIds?: ReadonlySet<string>): Promise<{
+    getAvailableAccount<TCredential = CodeArtsCredential | BuddyCredential>(provider: string, modelId: string, excludeAccountIds?: ReadonlySet<string>, 
+    /**
+     * 「轮换起点」：本会话指定的起始账号 id（可选；`undefined` = 默认起点）。
+     *
+     * ⚠️ **只旋转，不增删** —— 它不可用时仍会选中别的号（`tried` 循环照旧）。
+     * ⚠️ 本路径**没有余额档位**（候选已过 enabled / 封禁 / 限流）⇒ 纯旋转即可。
+     */
+    rotationStartId?: string): Promise<{
         entry: ProviderAccountEntry;
         credential: TCredential;
     } | null>;

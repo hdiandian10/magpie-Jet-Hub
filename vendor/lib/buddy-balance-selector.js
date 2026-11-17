@@ -36,7 +36,7 @@
  * 里面不含「按 now 现算」的成分，所以它没有这个问题 —— 不是漏改。
  */
 import { fetchCreditBalance } from './credits.js';
-import { buddyExpiringWindowDays, buddyBalanceTier, BUDDY_BALANCE_TIER, buddyTierUsable, rankBuddyAccountsByBalance, rankBuddyAccountsByManualOrder, splitBuddyCreditsByExpiry, } from './buddy-balance-rank.js';
+import { buddyExpiringWindowDays, buddyBalanceTier, BUDDY_BALANCE_TIER, buddyTierUsable, rankBuddyAccountsByBalance, rankBuddyAccountsByManualOrder, rotateFromPreferred, splitBuddyCreditsByExpiry, } from './buddy-balance-rank.js';
 /** 余额缓存 TTL（毫秒），与 Loomy 同值。 */
 export const BUDDY_BALANCE_CACHE_TTL_MS = 60_000;
 /**
@@ -244,10 +244,20 @@ export class BuddyBalanceSelector {
         // 并发查余额：账号数通常个位数，并发比串行快得多。
         const balances = await Promise.all(candidates.map((c) => this.balanceOf(c)));
         const byId = new Map(candidates.map((c, i) => [c.id, { account: c, balance: balances[i] }]));
-        const ranked = options.strictManualOrder === true
+        const rankedByStrategy = options.strictManualOrder === true
             // 严格手动顺序：档位只当「可用 / 不可用」判据，先后完全按用户的拖拽序。
             ? rankBuddyAccountsByManualOrder(balances, options)
             : rankBuddyAccountsByBalance(balances, options);
+        /**
+         * 「轮换起点」：**唯一旋转点**，必须在两种策略各自排完序之后。
+         *
+         * ⚠️ 不能放进那两个排序函数里 —— 会变成「同一语义两份实现」，
+         *    且默认模式与严格模式各一份，必然漂移。
+         * ⚠️ 必须在排序**之后** —— 放在前面会被排序覆盖掉。
+         * ⚠️ `rotationStartId` 为 `undefined` 时 `rotateFromPreferred` 原样返回
+         *    ⇒ 与改动前**逐字节相同**（本功能的唯一回归面）。
+         */
+        const ranked = rotateFromPreferred(rankedByStrategy, options);
         const first = ranked[0];
         if (first === undefined) {
             return { ok: false, reason: noAccountReason(balances) };
@@ -379,6 +389,12 @@ export async function pickBuddyAccount(selector, candidates, options) {
             // ⚠️ 每次迭代都带上：降级分支会把 `allowPermanent` 翻真，而本项与它无关，
             //    不能因为走了降级就把「严格手动顺序」丢掉（那会让用户开了开关却偶发失效）。
             ...(options.strictManualOrder === true ? { strictManualOrder: true } : {}),
+            // 「轮换起点」：同样每次迭代都带上（与 strictManualOrder 同因）——
+            // 降级会改变 `allowPermanent`、从而改变「哪些号可用」，起点必须跟着重算。
+            ...(options.rotationStartId === undefined ? {} : { rotationStartId: options.rotationStartId }),
+            // 「起点定位基准」同理：每次迭代都带上（降级会改变 `allowPermanent`，
+            // 从而改变「哪些号可用」，起点落点必须跟着重算）。
+            ...(options.enabledAccountIds === undefined ? {} : { enabledAccountIds: options.enabledAccountIds }),
         });
         if (!picked.ok) {
             /**

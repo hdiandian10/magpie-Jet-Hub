@@ -78,9 +78,26 @@ function failureMessage(reason) {
 }
 function consumeChunk(state, chunk) {
     switch (chunk.type) {
-        case 'text-delta':
+        case 'text-delta': {
+            /**
+             * 排队提示帧（provider 专有，目前只有 qoder 的 `visible` 档会发）。
+             *
+             * ⚠️⚠️ 它是**合法的 `text-delta`**（`text` 为空串），只是多带一个私有字段
+             * `qoderQueue`。**不能**给 `StreamChunk` 联合加新成员：宿主的两条组装器
+             * （`dsh-llm` 的 `BlockAssembler.push` 与 `AssistantStreamAccumulator.push`）
+             * 的 `default` 分支是 `assertNever`，任何联合外类型都会**硬抛**
+             * （2026-11-13 实测：`unreachable variant in BlockAssembler.push`）。
+             * 多带的字段会被它们忽略，所以「合法成员 + 私有字段」是唯一不扩宿主契约的形状。
+             *
+             * ⚠️ 提示帧**不能**贡献正文：`delta` 必须是空对象（`content` 留空），
+             * 否则每轮排队都会往回复里注入一个字符（2026-11-13 对抗审计实测）。
+             */
+            const queue = chunk.qoderQueue;
+            if (queue !== undefined)
+                return { delta: {}, notice: queue };
             state.content += chunk.text;
             return { delta: { content: chunk.text } };
+        }
         case 'reasoning-delta':
             state.reasoning += chunk.text;
             return { delta: { reasoning_content: chunk.text } };
@@ -172,7 +189,12 @@ export async function* toOpenAiSse(chunks, requestId = `chatcmpl-${randomUUID()}
                 yield line({ ...baseChunk(requestId, model, event.delta, event.finish_reason) });
             }
             else {
-                yield line(baseChunk(requestId, model, event.delta));
+                const base = baseChunk(requestId, model, event.delta);
+                // 排队提示帧：`qoder_queue` 是**非标准字段**，标准 OpenAI SDK 按协议会忽略它，
+                // 愿意读的客户端（面板 / 自研）据此显示「排队中（第 N 轮，预计 M 秒）」，
+                // 而不是只能看到一个没有 explain 的空心跳。
+                const notice = 'notice' in event ? event.notice : undefined;
+                yield line(notice === undefined ? base : { ...base, qoder_queue: notice });
             }
         }
         if (state.finishReason === undefined) {

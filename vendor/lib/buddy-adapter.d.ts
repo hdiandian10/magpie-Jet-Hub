@@ -38,7 +38,7 @@ export interface BuddyAdapterOptions {
     /** 前缀缓存会话标识（prompt_cache_key）；未提供时随机生成一个。 */
     sessionId?: string;
     /** 从凭据存储解析凭据。 */
-    resolveCredential: (modelId?: string) => Promise<BuddyCredential | undefined>;
+    resolveCredential: (modelId?: string, sessionId?: string) => Promise<BuddyCredential | undefined>;
     /** 静默续期凭据。 */
     refresh: () => Promise<void>;
     /** 动态拉取远端模型列表（含上下文窗口与能力，若远端下发）；失败时调用方回退到静态列表。 */

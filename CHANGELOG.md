@@ -11,6 +11,12 @@
 
 ## 1.0.0（未发布）
 
+- `feat(vendor)`: **内核升级到上游 dsh-providers-hub 2.27.261116（已构建）**（2026-11-16）。
+  vendor/lib 1238 文件；含 raccoon 签到、modelscope 下线过滤、qoder 代理、聚合归并等一批内核修复。
+  magpie 专有补丁（gemini 常量拆分、backup keepDisabledModels、baizhi.setSession、types.d.ts closeProvider）
+  已在 2.27 构建上重打；magicrew 系（magicrew-local-browser / magicrew-browser-login）与 leveldb-sstable
+  沿用上一版 1d12f80 的补丁版（magicrew 未适配新版 API，且本机不使用该渠道）。`node scripts/test-all.mjs` → 40 通过 / 0 失败。
+
 - `feat(page)`: **侧栏页加「签到」标签**（2026-11-13）。
   tab 栏 接入 / 控制台 / **签到** / 设置。magpie 的插件页沙箱（`connect-src 'none'`）
   决定了这个标签做不了「点了就领」的按钮 —— 它是引导页：控制台地址（与「控制台」

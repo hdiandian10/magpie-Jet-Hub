@@ -45,13 +45,13 @@
  *
  * 「哪些渠道能签到」的权威是客户端的 `credits-capabilities.js`（12 个渠道逐项
  * 登记）。在本模块再抄一份必然漂移（本仓库已有「两份名单漂移」的真实缺陷）。
- * 故判据交给 `credits.claimAll` 自己：cline / raccoon / **workbuddy** 三条分支
+ * 故判据交给 `credits.claimAll` 自己：当前只有 `cline` 这一条分支
  * **不发任何上游请求**就返回「不支持每日签到」，本模块把这类错误计为**跳过**，
  * 既不算失败也不重试。
  *
- * ⚠️ 其中 **workbuddy 的那条守卫是本功能先补上的**：此前它会落到 buddy 产品
- * 分支、真去发必然失败的签到请求（客户端从不调用它，是因为能力表写着 false，
- * 所以这个洞一直没被触发）。补上之后，「调用即判定」这条规则才真正安全。
+ * ⚠️ **workbuddy 已于 2026-11-15 退出这一组**：国际版其实**有**签到端点（与国内版
+ * 逐字同形），此前那条「不支持」的守卫是误判，现已改为真发领取 + 活跃上报
+ * （见 `workbuddy-intl-activity.ts` 与 `docs/agent-notes/providers-workbuddy-intl-checkin.md`）。
  *
  * ## ⚠️「调用即判定」管不到的一类：签到**有代价**的渠道
  *
@@ -171,6 +171,7 @@ export function sanitizeAutoCheckin(raw) {
         // 「默认保持打开状态」相反。`'false'` / `0` 这些非布尔值一律按打开处理 ——
         // 它们不是用户点出来的值。
         enabled: record.enabled !== false,
+        ...(record.modelscopeEnabled === false ? { modelscopeEnabled: false } : {}),
         times: sanitizeTimes(record.times),
         jitterMinutes: sanitizeJitter(record.jitterMinutes),
         lastDate: typeof record.lastDate === 'string' && DATE_RE.test(record.lastDate) ? record.lastDate : '',
@@ -495,6 +496,7 @@ class FileAutoCheckinStore {
         writeFileSync(tmp, JSON.stringify({
             schema: SCHEMA,
             enabled: doc.enabled,
+            modelscopeEnabled: doc.modelscopeEnabled,
             times: doc.times,
             jitterMinutes: doc.jitterMinutes,
             lastDate: doc.lastDate,
@@ -522,8 +524,15 @@ function emptyTotals() {
     return { providers: 0, claimed: 0, totalCredit: 0, totalByUnit: { token: 0, credit: 0 }, alreadyClaimed: 0, inactive: 0, failed: 0, coversToday: 0, skipped: 0, errors: 0 };
 }
 /**
- * 「不支持每日签到」的判据：`credits.claimAll` 对 cline / raccoon / workbuddy
- * 返回的**显式**错误文案（这三条分支都不发上游请求）。
+ * 「不支持每日签到」的判据：`credits.claimAll` 对**没有签到实现**的渠道返回的
+ * **显式**错误文案（这一条分支不发上游请求）。
+ *
+ * ⚠️ 这张名单**一直在缩小**，别把历史结论当成契约：
+ *   - `raccoon` 曾在这里（判据是「每日积分无端点」）—— 2026-11-15 被真实账号
+ *     推翻并接通了签到（办公端 `GET /api/web/office/v3/setting_info` 结算）⇒ **已移出**；
+ *   - `workbuddy` 国际版也曾在这里（判据是「内核只有 `get-dosage-notify`」）——
+ *     同一天查清签到端点是前端直接调的、与国内版逐字同形 ⇒ **已移出**（PR #87）。
+ *   两家移出后只剩 `cline`：对整个 sidecar 做字符串扫描都没有 checkin / campaign 端点。
  *
  * ⚠️ 兜底认 `unsupported provider`：那是 `productById` 找不到产品时的文案，
  * 语义同样是「这个渠道没有可用的签到实现」，计成失败只会制造假警报。
@@ -814,6 +823,12 @@ export function createAutoCheckin(deps) {
             // ⚠️ 排除表先于**任何**上游请求生效（见 isAutoCheckinExcluded 的说明）：
             // zcode 的代价发生在**调用期间**（拉起浏览器产 captcha），事后再判断已经
             // 太晚 —— 必须在调 `claim` 之前就把它摘掉。
+            if (provider === 'modelscope' && doc.modelscopeEnabled === false) {
+                totals.skipped += 1;
+                channels.push({ provider, text: '自动签到已关闭' });
+                unretryable.add(provider);
+                continue;
+            }
             if (isAutoCheckinExcluded(provider)) {
                 totals.skipped += 1;
                 channels.push({ provider, text: '需手动签到' });
@@ -1101,6 +1116,16 @@ export function createAutoCheckin(deps) {
     }
     return {
         state,
+        modelscopeEnabled: () => doc.modelscopeEnabled !== false,
+        async setModelscopeEnabled(enabled) {
+            const next = { ...doc };
+            if (enabled)
+                delete next.modelscopeEnabled;
+            else
+                next.modelscopeEnabled = false;
+            await deps.store.save(next);
+            doc = next;
+        },
         async setEnabled(enabled) {
             doc = { ...doc, enabled };
             await deps.store.save(doc);

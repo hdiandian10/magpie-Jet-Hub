@@ -820,7 +820,7 @@ export class LoomyAdapter extends LlmAdapter {
         //
         // ⚠️ **必须把模型 id 传给选号器**：Loomy 的选号要先按「该模型是否受限」
         // 过滤账号（限流按模型记），再按余额分档。传空串会让模型级限流失效。
-        let credential = await this.options.resolveCredential(options.model);
+        let credential = await this.options.resolveCredential(options.model, options.sessionId);
         if (credential === undefined || isLoomyExpired(credential)) {
             // ⚠️⚠️ 探测失败**只有一种**是终态：凭据确实失效（`RefreshTokenExpiredError`）。
             // 其余（网络超时、上游 5xx、`系统内部错误` 这类业务错误、非 JSON 响应）
@@ -875,7 +875,7 @@ export class LoomyAdapter extends LlmAdapter {
                     this.options.warn?.(`[loomy] 凭据探测失败（非终态，继续使用现有凭据，${LOOMY_PROBE_BACKOFF_MS / 1000} 秒内不再探测）：${error instanceof Error ? error.message : String(error)}`);
                 }
             }
-            credential = await this.options.resolveCredential(options.model);
+            credential = await this.options.resolveCredential(options.model, options.sessionId);
         }
         if (credential === undefined || credential.access_token.length === 0) {
             throw new LlmError('loomy: no usable credential; log in first', 'MISSING_CREDENTIAL');
@@ -1060,7 +1060,7 @@ export class LoomyAdapter extends LlmAdapter {
                 this.options.warn?.(`[loomy] 401/403 后凭据探测失败（非终态，改走换号）：${error instanceof Error ? error.message : String(error)}`);
             }
             if (!probeFailed) {
-                const refreshed = await this.options.resolveCredential(options.model);
+                const refreshed = await this.options.resolveCredential(options.model, options.sessionId);
                 if (refreshed === undefined || refreshed.access_token.length === 0) {
                     throw new LlmError('loomy: credential expired and refresh failed', 'AUTH', { status: response.status });
                 }

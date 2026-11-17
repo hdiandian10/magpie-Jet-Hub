@@ -156,7 +156,14 @@ export interface ResolverPool<TCredential = unknown> {
     /** 该 provider 是否处于「锁定永久积分」状态。 */
     permanentLocked(provider: string): boolean;
     /** 取「当前最该用的一个账号」；`null` = 没有可用账号。 */
-    getAvailableAccount(provider: string, modelId: string, excludeAccountIds?: ReadonlySet<string>): Promise<{
+    getAvailableAccount(provider: string, modelId: string, excludeAccountIds?: ReadonlySet<string>, 
+    /**
+     * 「轮换起点」：本会话指定的起始账号 id（可选）。
+     *
+     * ⚠️ 池实现**只做旋转**（从它起绕一圈），不增删候选 ⇒ 它不可用时仍会选中别的号。
+     * ⚠️ 未传 / 未实现时行为与改动前**逐字节相同**。
+     */
+    rotationStartId?: string): Promise<{
         entry: {
             id: string;
             credentialRef: string;
@@ -193,6 +200,15 @@ export interface ResolverPool<TCredential = unknown> {
      * 与单测 stub 不该因为「这个可选方法不存在」而被动获得新行为。
      */
     strictManualOrder?(provider: string): boolean;
+    /**
+     * 「轮换起点」（可选能力；真实 `AccountPool` 已实现）。
+     *
+     * 返回**本会话**指定的起始账号 id；`undefined` = 默认起点。
+     *
+     * ⚠️ **未实现时行为必须与改动前逐字节一致**（本功能的唯一回归面：
+     * 大量单测用结构化替身池，它们不认识本方法）。
+     */
+    preferredRotationFor?(provider: string, sessionId: string | undefined): string | undefined;
 }
 /** 注入的共享设施。 */
 export interface CredentialResolverDeps<TCredential = unknown> {

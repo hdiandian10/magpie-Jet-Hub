@@ -257,36 +257,6 @@ export async function handleBaizhiRpc(ctx, pool, method, payload) {
                 await pool.removeAccount(req.accountId);
                 return done({ accountId: id, masked: maskBaizhiKey(apiKey), renamed: true });
             }
-            /**
-             * 写入控制台网页登录态（`session_cookie`）—— 与 monkeycode 的
-             * `setSession` 逐条同型。
-             *
-             * ## 为什么必须有这个入口（2026-11-11 真机报障驱动）
-             *
-             * 百智云有**两套凭据**：
-             * · `sk-…` Key（`access_token`）→ 发消息，走 `x-api-key`；
-             * · 控制台 cookie（`sl-session` + `baizhi_session`）→ 积分 / 签到，
-             *   走 `/api/v1/user/*`，**拿 Key 打过去一律 401**。
-             *
-             * 而浏览器登录（`loginViaBrowser` / `loginSessionViaBrowser`）在服务器上
-             * 根本跑不起来 —— 它要 spawn 一个**可见**的 Chromium 窗口（见
-             * `baizhi-browser-login.js` 文件头），而服务器没有浏览器，用户也不在
-             * 那台机器前。于是「贴 Key 建号」能通、「贴 cookie 补积分」没有入口，
-             * 卡片上积分永远是「未登录」。
-             *
-             * 本方法补上第二条腿：面板把用户从浏览器里复制出来的 cookie 传进来，
-             * 只改凭据里的 `session_cookie`，**不碰账号条目**（cookie 与推理通道
-             * 完全解耦，没它推理照常可用）。
-             *
-             * ## 「字段缺失」与「传空串」语义相反 —— 必须区分
-             *
-             * 照抄 monkeycode 的三审修法：字段缺失 = 本次只读不写（回报现状），
-             * 传空串 = 清除会话（面板上的清空按钮走这条路）。混在一起会让
-             * 「传个只带 accountId 的 body」也把 cookie 抹掉。
-             *
-             * ⚠️ **合并写回，不能覆盖**：`access_token` 是推理用的唯一凭据，
-             * 丢了它账号就再也发不出消息，而用户没有任何提示。
-             */
             case 'baizhi.setSession': {
                 const req = (payload ?? {});
                 const accountId = typeof req.accountId === 'string' ? req.accountId.trim() : '';

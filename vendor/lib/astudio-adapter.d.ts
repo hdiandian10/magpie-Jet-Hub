@@ -60,7 +60,12 @@ export interface AstudioAdapterOptions {
      */
     auth?: AstudioAuth;
     /** 取当前凭据；缺省 `auth.currentCredential()`。 */
-    resolveCredential?: () => Promise<AstudioCredential | undefined>;
+    /**
+     * ⚠️ **第二参 `sessionId` 是「轮换起点」的作用域键**（PR #59 正向审计 P1-b）：
+     * 适配器必须把 `GenerateOptions.sessionId` 透传进来，否则选号层永远拿到
+     * `undefined` ⇒ 面板选的起点**静默失效**（tsc 因函数参数逆变不报）。
+     */
+    resolveCredential?: (modelId?: string, sessionId?: string) => Promise<AstudioCredential | undefined>;
     /** 401 后的**一次**权威重取；缺省 `auth.refreshOnce()`。 */
     refresh?: () => Promise<AstudioRefreshOutcome | undefined>;
     /** 读远端模型目录；缺省 `auth.fetchCatalogModels()`（GET model-manager/models）。 */

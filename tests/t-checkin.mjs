@@ -182,8 +182,8 @@ if (typeof toMagpieCheckin === 'function') {
     ok(
       // 大小写不敏感：等价写法 `=== ZCODE.id` 与 `=== 'zcode'` 都该放行（否则纯重构假红），
       // 但 `NEWSENSE` / `'lobsterai'` 这种**真的第四条**仍要红。
-      branches.length <= 1 && branches.every((n) => n.toLowerCase() === 'zcode'),
-      `claimAll 里的「按 provider 特判」只应有 ZCODE 一条，实际：${branches.join(', ') || '无'}`,
+      branches.length <= 2 && branches.every((n) => ['zcode', 'modelscope'].includes(n.toLowerCase())),
+      `claimAll 里的「按 provider 特判」只应有 ZCODE / MODELSCOPE，实际：${branches.join(', ') || '无'}`,
     )
     ok(/isQoderFamily\(req\.provider\)/.test(seg), 'claimAll 里的 Qoder 家族特例还在（isQoderFamily）')
     ok(/creditsOf\(credits, req\.provider\)/.test(seg), 'claimAll 里的能力表判据还在（creditsOf(...).claim）')
@@ -240,13 +240,13 @@ if (typeof toMagpieCheckin === 'function') {
   // 反向固定几个代表：文档与答复里点过名的，别让判据整体漂掉
   // 2026-11-02 上游同步：magicrew 系新增了 claimMagicrewLoginGift / claimMagicrewOnboardingTasks，
   // 在 provider-credits 表里已带 claim ⇒ 从「不该声明」名单移除。
-  const unsupported = ['jet-hub-cline', 'jet-hub-workbuddy', 'jet-hub-raccoon', 'jet-hub-modelscope', 'jet-hub-opencode', 'jet-hub-officeace', 'jet-hub-accio', 'jet-hub-gemini']
+  const unsupported = ['jet-hub-cline', 'jet-hub-opencode', 'jet-hub-officeace', 'jet-hub-accio', 'jet-hub-gemini']
   for (const id of unsupported) {
     const [, fn] = mod.PLUGINS.find(([i]) => i === id)
     const plugin = await fn({}, iso.options())
     ok(typeof plugin.auth.checkin !== 'function', `${id}: 上游没有签到实现，不该声明 auth.checkin（否则 magpie 会画一个必然失败的开关）`)
   }
-  const supported = ['jet-hub-trae', 'jet-hub-qoder', 'jet-hub-qodercn', 'jet-hub-zcode', 'jet-hub-lobsterai', 'jet-hub-loomy']
+  const supported = ['jet-hub-trae', 'jet-hub-qoder', 'jet-hub-qodercn', 'jet-hub-zcode', 'jet-hub-lobsterai', 'jet-hub-loomy', 'jet-hub-workbuddy', 'jet-hub-raccoon', 'jet-hub-modelscope']
   for (const id of supported) {
     const [, fn] = mod.PLUGINS.find(([i]) => i === id)
     const plugin = await fn({}, iso.options())
@@ -265,9 +265,9 @@ if (typeof toMagpieCheckin === 'function') {
 // 也就**不要**再调 `skipLive()`：那会让 `scripts/test-all.mjs` 的汇总行永远挂着
 // 「设 JET_HUB_LIVE=1 才会跑」，而这一节再也不会因为那个变量而跑（假承诺）。
 {
-  const [, wb] = mod.PLUGINS.find(([i]) => i === 'jet-hub-workbuddy')
+  const [, wb] = mod.PLUGINS.find(([i]) => i === 'jet-hub-cline')
   const wbPlugin = await wb({}, iso.options())
-  ok(typeof wbPlugin.auth.checkin !== 'function', 'workbuddy 不该有 auth.checkin（上游没有签到实现）')
+  ok(typeof wbPlugin.auth.checkin !== 'function', 'cline 不该有 auth.checkin（上游没有签到实现）')
   // 真支持签到的家必须有。这里只查形状、不真调 —— 真调会真的给账号领积分。
   const [, tr] = mod.PLUGINS.find(([i]) => i === 'jet-hub-trae')
   const trPlugin = await tr({}, iso.options())
